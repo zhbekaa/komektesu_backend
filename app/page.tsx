@@ -3,12 +3,25 @@
 import { useState } from "react";
 import { CityMap } from "@/components/CityMap";
 import { useSnapshot } from "@/components/useSnapshot";
-import { ago, statusLabel, statusTone, tankerLabel } from "@/lib/labels";
+import {
+  Badge,
+  Button,
+  Card,
+  Empty,
+  PageHeader,
+  SectionTitle,
+  SimulatedBadge,
+  Stat,
+} from "@/components/ui";
+import { ASSUMPTIONS } from "@/lib/aktau";
+import { joinDistricts, findDistrict } from "@/lib/districts";
+import { MAP, ago, litres, statusLabelShort, statusTone, tankerLabel, tankerTone } from "@/lib/labels";
 
 export default function OverviewPage() {
   const { data, error, act } = useSnapshot();
   const [busy, setBusy] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
 
   async function run(name: string, url: string, body: unknown) {
     setBusy(name);
@@ -26,136 +39,236 @@ export default function OverviewPage() {
     return <p className="text-[#667085]">{error ?? "Загрузка диспетчерской…"}</p>;
   }
 
-  const none = data.districts.filter((district) => district.status === "none");
-  const low = data.districts.filter((district) => district.status === "low");
+  const districts = joinDistricts(data.districts);
+  const selected = selectedId ? findDistrict(districts, selectedId) : null;
+  const none = districts.filter((district) => district.status === "none");
+  const low = districts.filter((district) => district.status === "low");
   const idle = data.tankers.filter((tanker) => tanker.status === "idle");
-  const recent = data.reports.filter((report) => data.serverTime - report.createdAt <= 15 * 60 * 1000);
+  const recent = data.reports.filter(
+    (report) => data.serverTime - report.createdAt <= ASSUMPTIONS.burstWindowMin * 60 * 1000,
+  );
+  const affected = none.reduce((sum, district) => sum + district.residential, 0);
 
   return (
-    <div className="flex flex-col gap-6">
-      <header className="flex flex-wrap items-end justify-between gap-4">
-        <div>
-          <p className="text-[13px] font-semibold text-[#2f6bff]">КЖСА · диспетчерская</p>
-          <h1 className="mt-1 text-[32px] font-bold tracking-tight">Вода в Актау</h1>
-          <p className="mt-1 text-[14px] text-[#667085]">Обновлено {ago(data.serverTime, Date.now())}</p>
-        </div>
-        <div className="flex flex-wrap gap-2">
-          <button
-            className="rounded-full bg-[#2f6bff] px-4 py-2.5 text-[14px] font-semibold text-white disabled:opacity-60"
-            disabled={busy !== null}
-            onClick={() => run("outage", "/api/demo", { action: "outage", districtId: "14" })}
-          >
-            {busy === "outage" ? "Отключаем…" : "Сценарий: отключение в 14 мкр"}
-          </button>
-          <button
-            className="rounded-full border border-[#e8ebf0] bg-white px-4 py-2.5 text-[14px] font-semibold disabled:opacity-60"
-            disabled={busy !== null}
-            onClick={() => run("reset", "/api/demo", { action: "reset" })}
-          >
-            Сбросить демо
-          </button>
-        </div>
-      </header>
-      {message ? <p className="text-[14px] text-[#e5484d]">{message}</p> : null}
+    <div className="flex flex-col gap-5">
+      <PageHeader
+        eyebrow={`${data.meta.operator} · диспетчерская`}
+        title="Вода в Актау"
+        lead={`${data.meta.coverage.districts} микрорайонов на карте. Источник — ${data.meta.waterSource}.`}
+        actions={
+          <>
+            <SimulatedBadge />
+            <Button
+              disabled={busy !== null}
+              onClick={() => run("outage", "/api/demo", { action: "outage", districtId: "17" })}
+            >
+              {busy === "outage" ? "Сценарий…" : "Сценарий: порыв в 17 мкр"}
+            </Button>
+            <Button
+              variant="ghost"
+              disabled={busy !== null}
+              onClick={() => run("reset", "/api/demo", { action: "reset" })}
+            >
+              Сбросить
+            </Button>
+          </>
+        }
+      />
 
-      <section className="grid grid-cols-2 gap-3 xl:grid-cols-4">
-        <Stat label="Без воды" value={String(none.length)} hint={none.map((item) => item.name).join(", ") || "нет"} tone="text-[#e5484d]" />
-        <Stat label="Слабый напор" value={String(low.length)} hint={low.map((item) => item.name).join(", ") || "нет"} tone="text-[#e09a12]" />
-        <Stat label="Свободные водовозы" value={String(idle.length)} hint={`из ${data.tankers.length} машин`} tone="text-[#2f6bff]" />
-        <Stat label="Жалобы за 15 мин" value={String(recent.length)} hint={recent.length >= 10 ? "порог аномалии" : "порог порыва: 10"} tone="text-[#1b1f27]" />
-      </section>
+      {message ? <p className="text-[13px] text-[#e5484d]">{message}</p> : null}
 
-      {data.anomalies.length > 0 ? (
-        <section className="rounded-2xl border border-[#f3c1c3] bg-[#fdecec] px-5 py-4">
-          <p className="text-[13px] font-semibold uppercase tracking-wide text-[#e5484d]">Аномалия</p>
-          {data.anomalies.map((anomaly) => (
-            <p key={anomaly.id} className="mt-1 text-[15px] font-medium">
-              {anomaly.message}
-            </p>
-          ))}
-        </section>
+      {data.incident ? (
+        <Card className="border-[#f6d5d5] bg-[#fdf4f4]">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div className="min-w-0">
+              <div className="flex items-center gap-2">
+                <Badge tone="bg-[#fdeaea] text-[#b4272b]">Инцидент</Badge>
+                <p className="text-[12px] text-[#98a2b3]">
+                  начат {ago(data.incident.startedAt, data.serverTime)}
+                </p>
+              </div>
+              <p className="mt-2 text-[17px] font-bold">{data.incident.title}</p>
+              <p className="mt-1 max-w-3xl text-[13px] leading-5 text-[#667085]">
+                {data.incident.summary}
+              </p>
+            </div>
+            {data.incident.expectedNormalAt ? (
+              <div className="rounded-xl bg-white px-4 py-3 text-center">
+                <p className="text-[11px] font-medium text-[#667085]">Ожидаемая норма</p>
+                <p className="mt-0.5 text-[22px] font-bold tabular-nums">
+                  {data.incident.expectedNormalAt}
+                </p>
+              </div>
+            ) : null}
+          </div>
+        </Card>
       ) : null}
 
-      <section className="grid gap-4 xl:grid-cols-[1.2fr_0.8fr]">
-        <div className="overflow-hidden rounded-[24px] bg-[#d4e5f2]">
-          <div className="h-[520px]">
-            <CityMap districts={data.districts} tankers={data.tankers} showTankers />
+      <div className="grid grid-cols-2 gap-3 xl:grid-cols-4">
+        <Stat
+          label="Районы без воды"
+          value={String(none.length)}
+          hint={none.map((item) => item.name).join(", ") || "нет"}
+          tone="text-[#b4272b]"
+          accent={MAP.none}
+        />
+        <Stat
+          label="Слабый напор"
+          value={String(low.length)}
+          hint={low.map((item) => item.name).join(", ") || "нет"}
+          tone="text-[#9a6400]"
+          accent={MAP.low}
+        />
+        <Stat
+          label="Свободные водовозы"
+          value={`${idle.length} / ${data.tankers.length}`}
+          hint={`Запас ${litres(idle.reduce((sum, item) => sum + item.waterLiters, 0))}`}
+          tone="text-[#2f6bff]"
+          accent={MAP.selected}
+        />
+        <Stat
+          label={`Жалобы за ${ASSUMPTIONS.burstWindowMin} мин`}
+          value={String(recent.length)}
+          hint={`Порог порыва — ${ASSUMPTIONS.burstThreshold} из одного дома`}
+          accent={MAP.normal}
+        />
+      </div>
+
+      <div className="grid gap-4 xl:grid-cols-[minmax(0,1.35fr)_minmax(0,0.65fr)]">
+        <Card padded={false} className="overflow-hidden">
+          <div className="flex items-center justify-between gap-3 border-b border-[#eef1f5] px-5 py-3.5">
+            <SectionTitle
+              aside={
+                <span className="text-[12px] text-[#98a2b3]">
+                  Обновлено {ago(data.serverTime, Date.now())}
+                </span>
+              }
+            >
+              Карта города
+            </SectionTitle>
           </div>
-        </div>
-        <div className="flex flex-col gap-3">
-          <h2 className="text-[18px] font-bold">Куда отправить водовоз</h2>
-          {data.suggestions.length === 0 ? (
-            <p className="rounded-2xl bg-white px-4 py-5 text-[14px] text-[#667085]">
-              Свободные машины покрывают районы без воды. Новое предложение появится, когда район станет красным или из одного дома придёт 10 жалоб за 15 минут.
-            </p>
+          <div className="h-[640px]">
+            <CityMap
+              districts={data.districts}
+              tankers={data.tankers}
+              showTankers
+              selectedId={selected?.id ?? null}
+              onSelect={setSelectedId}
+            />
+          </div>
+          {selected ? (
+            <div className="flex flex-wrap items-center gap-x-5 gap-y-2 border-t border-[#eef1f5] px-5 py-3.5">
+              <p className="text-[15px] font-bold">{selected.name}</p>
+              <Badge tone={statusTone(selected.status)}>{statusLabelShort(selected.status)}</Badge>
+              <span className="text-[12px] text-[#667085]">
+                {selected.pressureBar.toFixed(1)} бар
+              </span>
+              <span className="text-[12px] text-[#667085]">
+                {selected.areaKm2.toFixed(2)} км²
+                {data.meta.coverage.residentialBuildings > 0
+                  ? ` · ${selected.residential} жилых домов`
+                  : ""}
+              </span>
+              <span className="text-[12px] text-[#667085]">
+                жалоб за 6 ч: {selected.complaints6h}
+              </span>
+              {selected.cause ? (
+                <span className="text-[12px] text-[#98a2b3]">{selected.cause}</span>
+              ) : null}
+            </div>
           ) : (
-            data.suggestions.map((suggestion) => (
-              <article key={suggestion.districtId} className="rounded-2xl bg-white p-4 shadow-[0_8px_18px_rgba(26,38,64,0.06)]">
-                <p className="text-[16px] font-bold">{suggestion.districtName}</p>
-                <p className="mt-1 text-[13px] leading-5 text-[#667085]">{suggestion.reason}</p>
-                <p className="mt-3 text-[14px] font-semibold">
-                  Водовоз №{suggestion.tankerNumber} · {suggestion.etaMinutes} мин
-                </p>
-                <button
-                  className="mt-3 w-full rounded-full bg-[#2f6bff] py-2.5 text-[14px] font-semibold text-white"
-                  onClick={() =>
-                    run(suggestion.districtId, "/api/dispatch", {
-                      districtId: suggestion.districtId,
-                      building: "12",
-                    })
-                  }
-                >
-                  Отправить №{suggestion.tankerNumber}
-                </button>
-              </article>
-            ))
+            <p className="border-t border-[#eef1f5] px-5 py-3.5 text-[12px] text-[#98a2b3]">
+              Выберите район на карте. Колесо — масштаб, перетаскивание — сдвиг.
+            </p>
           )}
-          <h2 className="mt-2 text-[18px] font-bold">Флот</h2>
-          <ul className="overflow-hidden rounded-2xl bg-white">
-            {data.tankers.map((tanker) => (
-              <li key={tanker.id} className="flex items-center justify-between border-b border-[#e8ebf0] px-4 py-3 last:border-0">
-                <div>
-                  <p className="text-[14px] font-semibold">№{tanker.number}</p>
-                  <p className="text-[12px] text-[#98a2b3]">{tanker.waterLiters.toLocaleString("ru-RU")} л</p>
-                </div>
-                <span className={`rounded-full px-2.5 py-1 text-[12px] font-semibold ${tanker.status === "idle" ? "bg-[#e5f8ec] text-[#1f9d55]" : tanker.status === "en_route" ? "bg-[#e7f0ff] text-[#2f6bff]" : "bg-[#fff4de] text-[#e09a12]"}`}>
-                  {tankerLabel(tanker.status)}
-                  {tanker.status === "en_route" ? ` · ${tanker.etaMinutes} мин` : ""}
-                </span>
-              </li>
-            ))}
-          </ul>
-        </div>
-      </section>
+        </Card>
 
-      <section>
-        <h2 className="mb-3 text-[18px] font-bold">Районы</h2>
-        <div className="grid grid-cols-2 gap-3 lg:grid-cols-5">
-          {data.districts.map((district) => (
-            <article key={district.id} className="rounded-2xl bg-white px-4 py-3">
-              <div className="flex items-center justify-between gap-2">
-                <p className="font-semibold">{district.name}</p>
-                <span className={`rounded-full px-2 py-0.5 text-[11px] font-semibold ${statusTone(district.status)}`}>
-                  {statusLabel(district.status)}
-                </span>
-              </div>
-              <p className="mt-2 text-[12px] text-[#98a2b3]">
-                {district.pressureBar.toFixed(1)} бар · жалоб {data.complaintCounts[district.id] ?? 0}
-              </p>
-            </article>
-          ))}
+        <div className="flex min-w-0 flex-col gap-4">
+          <Card>
+            <SectionTitle>Куда отправить водовоз</SectionTitle>
+            <div className="mt-3 flex flex-col gap-2.5">
+              {data.suggestions.length === 0 ? (
+                <Empty>
+                  Все районы без воды уже закрыты машинами. Предложение появится, когда житель
+                  запросит подвоз или откроется новое отключение.
+                </Empty>
+              ) : (
+                data.suggestions.map((suggestion) => (
+                  <article
+                    key={suggestion.districtId}
+                    className="rounded-xl border border-[#e8ebf0] p-3.5"
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <p className="text-[15px] font-bold">{suggestion.districtName}</p>
+                      <Badge tone="bg-[#e7f0ff] text-[#2f6bff]">
+                        {suggestion.etaMinutes} мин
+                      </Badge>
+                    </div>
+                    <p className="mt-1.5 text-[12px] leading-[18px] text-[#667085]">
+                      {suggestion.reason}
+                    </p>
+                    <p className="mt-2 text-[12px] font-medium text-[#344054]">
+                      №{suggestion.tankerNumber} · {suggestion.tankerPlate} ·{" "}
+                      {suggestion.distanceKm} км
+                    </p>
+                    <div className="mt-3">
+                      <Button
+                        disabled={busy !== null}
+                        onClick={() =>
+                          run(suggestion.districtId, "/api/dispatch", {
+                            districtId: suggestion.districtId,
+                          })
+                        }
+                      >
+                        {busy === suggestion.districtId
+                          ? "Отправляем…"
+                          : `Отправить №${suggestion.tankerNumber}`}
+                      </Button>
+                    </div>
+                  </article>
+                ))
+              )}
+            </div>
+          </Card>
+
+          <Card padded={false}>
+            <div className="px-5 py-3.5">
+              <SectionTitle
+                aside={<span className="text-[12px] text-[#98a2b3]">{data.tankers.length} машин</span>}
+              >
+                Флот
+              </SectionTitle>
+            </div>
+            <ul className="border-t border-[#eef1f5]">
+              {data.tankers.map((tanker) => (
+                <li
+                  key={tanker.id}
+                  className="flex items-center justify-between gap-3 border-b border-[#f2f4f7] px-5 py-2.5 last:border-0"
+                >
+                  <div className="min-w-0">
+                    <p className="text-[13px] font-semibold">
+                      №{tanker.number}
+                      <span className="ml-2 font-normal text-[#98a2b3]">{tanker.plate}</span>
+                    </p>
+                    <p className="text-[11px] text-[#98a2b3]">
+                      {litres(tanker.waterLiters)} из {litres(tanker.capacityLiters)}
+                    </p>
+                  </div>
+                  <Badge tone={tankerTone(tanker.status)}>
+                    {tankerLabel(tanker.status)}
+                    {tanker.status === "en_route" ? ` · ${tanker.etaMinutes} мин` : ""}
+                  </Badge>
+                </li>
+              ))}
+            </ul>
+          </Card>
         </div>
-      </section>
+      </div>
+
+      <Card>
+        <SectionTitle aside={<SimulatedBadge compact />}>Обстановка</SectionTitle>
+        <p className="mt-2 max-w-4xl text-[14px] leading-6 text-[#344054]">{data.situation}</p>
+      </Card>
     </div>
-  );
-}
-
-function Stat({ label, value, hint, tone }: { label: string; value: string; hint: string; tone: string }) {
-  return (
-    <article className="rounded-2xl bg-white px-4 py-4">
-      <p className="text-[13px] text-[#667085]">{label}</p>
-      <p className={`mt-1 text-[32px] font-bold leading-none ${tone}`}>{value}</p>
-      <p className="mt-2 truncate text-[12px] text-[#98a2b3]">{hint}</p>
-    </article>
   );
 }

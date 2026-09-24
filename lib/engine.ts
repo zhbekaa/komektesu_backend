@@ -1,295 +1,364 @@
+/**
+ * In-memory simulation of Aktau's water supply for the MVP.
+ *
+ * The map, district names, adjacency and distances are real (OpenStreetMap, see
+ * lib/aktau-geo.ts). The operational layer — pressure, outages, fleet, resident
+ * complaints — is generated here from a seeded scenario so a demo is repeatable.
+ * Snapshots carry `meta.simulated` so the UI can label it honestly.
+ */
+
+import { DEPOT, DISTRICT_GEO, type DistrictGeo } from "./aktau-geo";
+import {
+  ASSUMPTION_NOTES,
+  ASSUMPTIONS,
+  CITY,
+  COVERAGE,
+  SOURCES,
+  UTILITY,
+  WATER_SOURCE,
+  etaMinutesForUnits,
+  unitsToKm,
+} from "./aktau";
+import { persistReport } from "./supabase";
 import type {
   Anomaly,
   AppNotification,
   DeliveryRequest,
-  District,
+  DistrictState,
+  Incident,
   Report,
   ReportType,
   ScheduleSlot,
   Snapshot,
+  Suggestion,
   Tanker,
   WaterStatus,
 } from "./types";
-import { persistReport } from "./supabase";
 
-/** Real seconds pass faster so an 8-minute arrival is visible in a pitch. */
+/** Trips play back faster than real life so an arrival is visible in a pitch. */
 export const SIM_RATIO = 20;
-const BURST_WINDOW_MS = 15 * 60 * 1000;
-const BURST_THRESHOLD = 10;
+
+const BURST_WINDOW_MS = ASSUMPTIONS.burstWindowMin * 60 * 1000;
+const BURST_THRESHOLD = ASSUMPTIONS.burstThreshold;
+
+/** Districts with residents. Industrial quarters are map context only. */
+export const SERVED_DISTRICTS = DISTRICT_GEO.filter(
+  (district) => district.kind !== "industrial",
+);
+
+const GEO_BY_ID = new Map(DISTRICT_GEO.map((district) => [district.id, district]));
+
+export function geoFor(id: string): DistrictGeo | undefined {
+  return GEO_BY_ID.get(id);
+}
+
+export const DEFAULT_HOME_DISTRICT = "14";
+
+// --- scenario ---------------------------------------------------------------
+
+/**
+ * The incident the demo opens on: a repair on the main feeding 14 and 15 мкр,
+ * two genuinely adjacent central microdistricts.
+ */
+const SCENARIO = {
+  id: "feeder-14-15",
+  title: "Ремонт на магистрали, 14 и 15 мкр",
+  summary:
+    "Бригада КЖСА меняет участок магистрали между 14 и 15 мкр. Подача в двух районах перекрыта, у соседних районов просело давление.",
+  outage: ["14", "15"],
+  expectedNormalAt: "18:00",
+  startedMinutesAgo: 96,
+} as const;
+
+/**
+ * Newer districts on the northern edge sit furthest from the depot and the
+ * reservoir, so they carry chronically weaker pressure in this scenario.
+ */
+const FAR_EDGE_KM = 4.3;
+
+function scenarioStatuses() {
+  const statuses = new Map<string, { status: WaterStatus; cause: string | null }>();
+  for (const district of SERVED_DISTRICTS) {
+    statuses.set(district.id, { status: "normal", cause: null });
+  }
+
+  for (const id of SCENARIO.outage) {
+    statuses.set(id, { status: "none", cause: SCENARIO.title });
+  }
+
+  // Neighbours of an outage lose pressure because the branch is re-routed.
+  for (const id of SCENARIO.outage) {
+    for (const neighbour of geoFor(id)?.neighbours ?? []) {
+      const current = statuses.get(neighbour);
+      if (!current || current.status !== "normal") continue;
+      statuses.set(neighbour, {
+        status: "low",
+        cause: `Переключение сети из-за работ в ${geoFor(id)?.name ?? id}`,
+      });
+    }
+  }
+
+  for (const district of SERVED_DISTRICTS) {
+    const current = statuses.get(district.id);
+    if (!current || current.status !== "normal") continue;
+    if (district.depotKm >= FAR_EDGE_KM) {
+      statuses.set(district.id, {
+        status: "low",
+        cause: "Удалённый участок сети, давление ниже нормы в часы пик",
+      });
+    }
+  }
+
+  return statuses;
+}
+
+// --- deterministic randomness ----------------------------------------------
+
+/** Mulberry32, so a reset reproduces the same demo. */
+function rng(seed: number) {
+  let state = seed >>> 0;
+  return () => {
+    state = (state + 0x6d2b79f5) >>> 0;
+    let t = state;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/** Kazakh and Russian given names, matching how Aktau's population reads. */
+const FIRST_NAMES = [
+  "Айбек", "Әсел", "Нұрлан", "Гүлнар", "Ержан", "Динара", "Мадина", "Тимур",
+  "Алия", "Дәурен", "Жанна", "Санжар", "Аяулым", "Бекзат", "Елена", "Сергей",
+  "Ольга", "Дмитрий", "Наталья", "Андрей", "Ирина", "Виктор", "Асхат", "Камила",
+];
+const SURNAME_INITIALS = [
+  "А.", "Б.", "Д.", "Е.", "Ж.", "К.", "М.", "Н.", "О.", "С.", "Т.", "Ш.",
+];
+
+function personName(random: () => number) {
+  const first = FIRST_NAMES[Math.floor(random() * FIRST_NAMES.length)];
+  const initial = SURNAME_INITIALS[Math.floor(random() * SURNAME_INITIALS.length)];
+  return `${first} ${initial}`;
+}
+
+/**
+ * Plausible building number. Aktau numbers buildings within a microdistrict,
+ * and bigger districts hold more of them.
+ */
+function buildingNumber(district: DistrictGeo, random: () => number) {
+  const ceiling = Math.max(8, Math.min(72, Math.round(district.areaKm2 * 70)));
+  return String(1 + Math.floor(random() * ceiling));
+}
+
+// --- store ------------------------------------------------------------------
 
 type Store = {
-  districts: District[];
+  districts: DistrictState[];
   tankers: Tanker[];
   reports: Report[];
   requests: DeliveryRequest[];
   notifications: AppNotification[];
+  incident: Incident | null;
   nextRequestNumber: number;
 };
 
-const globalStore = globalThis as typeof globalThis & { __komektesu?: Store };
+/** Bump when `Store` changes shape, so a hot reload discards the old snapshot. */
+const STORE_VERSION = 4;
+
+const globalStore = globalThis as typeof globalThis & {
+  __komektesu?: Store;
+  __komektesuVersion?: number;
+};
 
 function uid() {
   return Math.random().toString(36).slice(2, 10);
 }
 
-function pressureFor(status: WaterStatus) {
-  if (status === "none") return 0.2;
-  if (status === "low") return 1.1;
-  return 3.2;
+function pressureFor(status: WaterStatus, random?: () => number) {
+  const jitter = random ? (random() - 0.5) * 0.4 : 0;
+  if (status === "none") return Math.max(0, ASSUMPTIONS.outagePressureBar + jitter * 0.3);
+  if (status === "low") return Math.max(0.4, ASSUMPTIONS.lowPressureBar + jitter);
+  return ASSUMPTIONS.nominalPressureBar + jitter;
 }
-
-const DISTRICT_DEFS: Omit<District, "status" | "expectedNormalAt" | "updatedAt" | "pressureBar">[] = [
-  {
-    id: "17",
-    name: "17 мкр",
-    baseFill: "#8FCF7C",
-    path: "M150 48L208 34L232 72L204 112L150 104L128 72L150 48Z",
-    label: { x: 156, y: 62 },
-    anchor: { x: 180, y: 73 },
-  },
-  {
-    id: "18",
-    name: "18 мкр",
-    baseFill: "#8FCF7C",
-    path: "M240 30L318 22L346 62L316 102L248 94L222 58L240 30Z",
-    label: { x: 262, y: 50 },
-    anchor: { x: 284, y: 62 },
-  },
-  {
-    id: "16",
-    name: "16 мкр",
-    baseFill: "#7EC86E",
-    path: "M58 118L132 100L162 140L138 186L68 180L36 142L58 118Z",
-    label: { x: 78, y: 132 },
-    anchor: { x: 99, y: 143 },
-  },
-  {
-    id: "14",
-    name: "14 мкр",
-    baseFill: "#8FCF7C",
-    path: "M150 118L232 100L274 142L262 210L190 226L138 186L130 146L150 118Z",
-    label: { x: 178, y: 150 },
-    anchor: { x: 190, y: 163 },
-  },
-  {
-    id: "12",
-    name: "12 мкр",
-    baseFill: "#8FCF7C",
-    path: "M274 126L350 114L372 168L336 210L274 194L250 156L274 126Z",
-    label: { x: 286, y: 150 },
-    anchor: { x: 311, y: 162 },
-  },
-  {
-    id: "11",
-    name: "11 мкр",
-    baseFill: "#7EC86E",
-    path: "M42 196L124 184L154 232L120 278L42 268L18 226L42 196Z",
-    label: { x: 62, y: 218 },
-    anchor: { x: 86, y: 231 },
-  },
-  {
-    id: "9",
-    name: "9 мкр",
-    baseFill: "#8FCF7C",
-    path: "M166 214L246 202L278 254L238 306L164 296L140 252L166 214Z",
-    label: { x: 186, y: 242 },
-    anchor: { x: 209, y: 254 },
-  },
-  {
-    id: "7",
-    name: "7 мкр",
-    baseFill: "#8FCF7C",
-    path: "M28 286L114 274L138 326L106 372L28 362L6 320L28 286Z",
-    label: { x: 48, y: 312 },
-    anchor: { x: 72, y: 323 },
-  },
-  {
-    id: "3",
-    name: "3 мкр",
-    baseFill: "#7EC86E",
-    path: "M148 308L224 298L250 350L210 394L144 382L126 338L148 308Z",
-    label: { x: 164, y: 336 },
-    anchor: { x: 188, y: 346 },
-  },
-  {
-    id: "1",
-    name: "1 мкр",
-    baseFill: "#8FCF7C",
-    path: "M20 378L96 364L116 418L68 454L12 434L0 396L20 378Z",
-    label: { x: 36, y: 400 },
-    anchor: { x: 58, y: 409 },
-  },
-];
 
 function distance(ax: number, ay: number, bx: number, by: number) {
   return Math.hypot(ax - bx, ay - by);
 }
 
-export function etaMinutesFor(dist: number) {
-  return Math.max(4, Math.min(28, Math.round(dist / 12.3)));
+/** Delivery point for a district: its centroid, which is inside the polygon. */
+function deliveryPoint(district: DistrictGeo) {
+  return { x: district.center.x, y: district.center.y };
 }
 
-function homePoint(district: District) {
-  return { x: district.anchor.x, y: district.anchor.y + 16 };
+/** Fleet parked at the real КЖСА yard, spread so pins do not overlap. */
+function createFleet(random: () => number): Tanker[] {
+  const specs = [
+    { number: 12, plate: "823 KZ 12", capacity: 6000 },
+    { number: 7, plate: "417 AK 12", capacity: 4000 },
+    { number: 4, plate: "205 BN 12", capacity: 4000 },
+    { number: 9, plate: "744 CH 12", capacity: 10000 },
+    { number: 3, plate: "118 DM 12", capacity: 6000 },
+    { number: 21, plate: "560 EL 12", capacity: 4000 },
+  ];
+  return specs.map((spec, index) => {
+    const angle = (index / specs.length) * Math.PI * 2;
+    const x = DEPOT.x + Math.cos(angle) * 22;
+    const y = DEPOT.y + Math.sin(angle) * 22;
+    const fill = 0.55 + random() * 0.45;
+    return {
+      id: String(spec.number),
+      number: spec.number,
+      plate: spec.plate,
+      status: "idle" as const,
+      capacityLiters: spec.capacity,
+      waterLiters: Math.round((spec.capacity * fill) / 100) * 100,
+      x,
+      y,
+      startX: x,
+      startY: y,
+      targetX: x,
+      targetY: y,
+      targetDistrictId: null,
+      tripStartedAt: null,
+      tripDurationMs: 0,
+      initialEtaMin: 0,
+    };
+  });
 }
 
 function createStore(now = Date.now()): Store {
-  const districts: District[] = DISTRICT_DEFS.map((def) => {
-    const status: WaterStatus = def.id === "14" ? "low" : def.id === "9" ? "none" : "normal";
+  const random = rng(20240924);
+  const statuses = scenarioStatuses();
+
+  const districts: DistrictState[] = SERVED_DISTRICTS.map((geo) => {
+    const { status, cause } = statuses.get(geo.id) ?? { status: "normal", cause: null };
     return {
-      ...def,
+      id: geo.id,
       status,
-      expectedNormalAt: status === "low" ? "18:00" : status === "none" ? null : null,
-      updatedAt: now - (def.id === "14" ? 10 : def.id === "9" ? 26 : 40) * 60 * 1000,
-      pressureBar: pressureFor(status),
+      pressureBar: Number(pressureFor(status, random).toFixed(1)),
+      expectedNormalAt: status === "none" ? SCENARIO.expectedNormalAt : null,
+      updatedAt:
+        now - Math.round((status === "normal" ? 25 + random() * 40 : 4 + random() * 14)) * 60 * 1000,
+      complaints6h: 0,
+      cause,
     };
   });
 
-  const tankers: Tanker[] = [
-    {
-      id: "12",
-      number: 12,
-      status: "idle",
-      waterLiters: 4000,
-      x: 200,
-      y: 78,
-      startX: 200,
-      startY: 78,
-      targetX: 200,
-      targetY: 78,
-      targetDistrictId: null,
-      tripStartedAt: null,
-      tripDurationMs: 0,
-      initialEtaMin: 0,
-    },
-    {
-      id: "7",
-      number: 7,
-      status: "idle",
-      waterLiters: 3200,
-      x: 78,
-      y: 248,
-      startX: 78,
-      startY: 248,
-      targetX: 78,
-      targetY: 248,
-      targetDistrictId: null,
-      tripStartedAt: null,
-      tripDurationMs: 0,
-      initialEtaMin: 0,
-    },
-    {
-      id: "4",
-      number: 4,
-      status: "serving",
-      waterLiters: 1800,
-      x: 330,
-      y: 150,
-      startX: 330,
-      startY: 150,
-      targetX: 330,
-      targetY: 150,
-      targetDistrictId: "12",
-      tripStartedAt: null,
-      tripDurationMs: 0,
-      initialEtaMin: 0,
-    },
-    {
-      id: "9",
-      number: 9,
-      status: "idle",
-      waterLiters: 5100,
-      x: 250,
-      y: 300,
-      startX: 250,
-      startY: 300,
-      targetX: 250,
-      targetY: 300,
-      targetDistrictId: null,
-      tripStartedAt: null,
-      tripDurationMs: 0,
-      initialEtaMin: 0,
-    },
-    {
-      id: "3",
-      number: 3,
-      status: "idle",
-      waterLiters: 4500,
-      x: 145,
-      y: 48,
-      startX: 145,
-      startY: 48,
-      targetX: 145,
-      targetY: 48,
-      targetDistrictId: null,
-      tripStartedAt: null,
-      tripDurationMs: 0,
-      initialEtaMin: 0,
-    },
-  ];
+  const incident: Incident = {
+    id: SCENARIO.id,
+    title: SCENARIO.title,
+    summary: SCENARIO.summary,
+    districtIds: [...SCENARIO.outage],
+    startedAt: now - SCENARIO.startedMinutesAgo * 60 * 1000,
+    expectedNormalAt: SCENARIO.expectedNormalAt,
+  };
 
+  // Complaints cluster where supply is broken and trickle in elsewhere.
   const reports: Report[] = [];
-  for (let i = 0; i < 12; i += 1) {
+  function addSeedReport(geo: DistrictGeo, type: ReportType, minutesAgo: number) {
     reports.push({
-      id: `hist-${i}`,
-      districtId: i % 2 === 0 ? "14" : "9",
-      building: "12",
-      type: i % 3 === 0 ? "low_pressure" : "no_water",
-      residentName: "Айбек Н.",
-      createdAt: now - (i === 0 ? 26 : 26 + i * 20) * 60 * 60 * 1000,
-      confirmed: i >= 3,
+      id: `seed-${reports.length}`,
+      districtId: geo.id,
+      building: buildingNumber(geo, random),
+      type,
+      residentName: personName(random),
+      createdAt: now - Math.round(minutesAgo * 60 * 1000),
+      confirmed: minutesAgo > 45,
     });
   }
 
-  const cityNoise: { districtId: string; type: ReportType; hoursAgo: number }[] = [
-    { districtId: "9", type: "no_water", hoursAgo: 1 },
-    { districtId: "9", type: "no_water", hoursAgo: 1.2 },
-    { districtId: "9", type: "emergency", hoursAgo: 2 },
-    { districtId: "9", type: "no_water", hoursAgo: 3 },
-    { districtId: "14", type: "low_pressure", hoursAgo: 2 },
-    { districtId: "14", type: "low_pressure", hoursAgo: 5 },
-    { districtId: "11", type: "no_hot", hoursAgo: 4 },
-    { districtId: "7", type: "low_pressure", hoursAgo: 6 },
-    { districtId: "3", type: "no_hot", hoursAgo: 7 },
-    { districtId: "16", type: "low_pressure", hoursAgo: 8 },
-    { districtId: "1", type: "no_water", hoursAgo: 9 },
-    { districtId: "18", type: "low_pressure", hoursAgo: 3 },
-  ];
-  cityNoise.forEach((item, index) => {
+  for (const geo of SERVED_DISTRICTS) {
+    const state = districts.find((item) => item.id === geo.id);
+    if (!state) continue;
+    if (state.status === "none") {
+      const count = 6 + Math.floor(random() * 5);
+      for (let i = 0; i < count; i += 1) {
+        addSeedReport(geo, random() < 0.75 ? "no_water" : "emergency", random() * 180);
+      }
+    } else if (state.status === "low") {
+      const count = 1 + Math.floor(random() * 3);
+      for (let i = 0; i < count; i += 1) {
+        addSeedReport(geo, random() < 0.7 ? "low_pressure" : "no_hot", random() * 320);
+      }
+    } else if (random() < 0.22) {
+      addSeedReport(geo, random() < 0.5 ? "no_hot" : "low_pressure", 60 + random() * 400);
+    }
+  }
+  // The resident demo opens as Айбек Н. at 14 мкр, дом 12. One real signal so
+  // history is not blank; a different address still has none.
+  const demoHome = geoFor("14");
+  if (demoHome) {
     reports.push({
-      id: `city-${index}`,
-      districtId: item.districtId,
-      building: String(4 + (index % 6)),
-      type: item.type,
-      residentName: `Житель ${index + 1}`,
-      createdAt: now - item.hoursAgo * 60 * 60 * 1000,
-      confirmed: item.hoursAgo > 4,
+      id: "seed-demo-aybek",
+      districtId: demoHome.id,
+      building: "12",
+      type: "no_water",
+      residentName: "Айбек Н.",
+      createdAt: now - 3 * 60 * 60 * 1000,
+      confirmed: false,
     });
-  });
+  }
+  reports.sort((a, b) => b.createdAt - a.createdAt);
 
+  const tankers = createFleet(random);
+
+  // One tanker is already handing out water in the worst-hit district.
+  const firstOutage = geoFor(SCENARIO.outage[0]);
+  const requests: DeliveryRequest[] = [];
+  let nextRequestNumber = 461;
+  if (firstOutage) {
+    const point = deliveryPoint(firstOutage);
+    const serving = tankers[0];
+    serving.status = "serving";
+    serving.x = point.x;
+    serving.y = point.y;
+    serving.startX = point.x;
+    serving.startY = point.y;
+    serving.targetX = point.x;
+    serving.targetY = point.y;
+    serving.targetDistrictId = firstOutage.id;
+    serving.waterLiters = Math.round(serving.capacityLiters * 0.35);
+    requests.push({
+      id: "req-460",
+      number: 460,
+      districtId: firstOutage.id,
+      building: buildingNumber(firstOutage, random),
+      tankerId: serving.id,
+      status: "done",
+      createdAt: now - 42 * 60 * 1000,
+      residentName: personName(random),
+    });
+  }
+
+  const outageNames = SCENARIO.outage
+    .map((id) => geoFor(id)?.name ?? id)
+    .join(" и ");
   const notifications: AppNotification[] = [
     {
       id: "n1",
-      title: "Перебои с давлением",
-      body: "Сегодня в 14 мкр возможны перебои с давлением.",
-      createdAt: now - 20 * 60 * 1000,
+      title: `Нет воды: ${outageNames}`,
+      body: `${SCENARIO.summary} Ожидаемое восстановление — ${SCENARIO.expectedNormalAt}.`,
+      createdAt: incident.startedAt,
       read: false,
-      kind: "schedule",
+      kind: "outage",
     },
     {
       id: "n2",
-      title: "Водовозы в городе",
-      body: "Доступно 5 водовозов. Ближайший №12 — около 8 минут.",
-      createdAt: now - 2 * 60 * 1000,
+      title: "Водовоз на месте",
+      body: firstOutage
+        ? `Водовоз №${tankers[0].number} раздаёт воду в ${firstOutage.name}.`
+        : "Водовоз раздаёт воду.",
+      createdAt: now - 18 * 60 * 1000,
       read: false,
       kind: "tanker",
     },
     {
       id: "n3",
-      title: "График на вечер",
-      body: "В 18:00 в 14 мкр ожидается нормальное давление.",
-      createdAt: now - 50 * 60 * 1000,
-      read: false,
+      title: "График подачи",
+      body: `Восстановление подачи в ${outageNames} запланировано на ${SCENARIO.expectedNormalAt}.`,
+      createdAt: now - 52 * 60 * 1000,
+      read: true,
       kind: "schedule",
     },
   ];
@@ -298,32 +367,29 @@ function createStore(now = Date.now()): Store {
     districts,
     tankers,
     reports,
-    requests: [
-      {
-        id: "req-458",
-        number: 458,
-        districtId: "14",
-        building: "12",
-        tankerId: "12",
-        status: "accepted",
-        createdAt: now - 8 * 60 * 1000,
-        residentName: "Айбек Н.",
-      },
-    ],
+    requests,
     notifications,
-    nextRequestNumber: 459,
+    incident,
+    nextRequestNumber,
   };
 }
 
 function store() {
-  if (!globalStore.__komektesu) globalStore.__komektesu = createStore();
+  if (!globalStore.__komektesu || globalStore.__komektesuVersion !== STORE_VERSION) {
+    globalStore.__komektesu = createStore();
+    globalStore.__komektesuVersion = STORE_VERSION;
+  }
   return globalStore.__komektesu;
 }
 
-function districtById(id: string) {
+function stateById(id: string) {
   const district = store().districts.find((item) => item.id === id);
   if (!district) throw new Error(`Unknown district ${id}`);
   return district;
+}
+
+function nameFor(id: string) {
+  return geoFor(id)?.name ?? id;
 }
 
 function notify(title: string, body: string, kind: AppNotification["kind"]) {
@@ -337,71 +403,88 @@ function notify(title: string, body: string, kind: AppNotification["kind"]) {
   });
 }
 
+// --- trips ------------------------------------------------------------------
+
 function settleTrips(s: Store, now: number) {
   for (const tanker of s.tankers) {
-    if (tanker.status !== "en_route" || !tanker.tripStartedAt || !tanker.tripDurationMs) continue;
-    const progress = (now - tanker.tripStartedAt) / tanker.tripDurationMs;
-    if (progress < 1) continue;
+    if (tanker.status !== "en_route" || !tanker.tripStartedAt || !tanker.tripDurationMs) {
+      continue;
+    }
+    if ((now - tanker.tripStartedAt) / tanker.tripDurationMs < 1) continue;
     tanker.status = "serving";
     tanker.x = tanker.targetX;
     tanker.y = tanker.targetY;
-    tanker.waterLiters = Math.max(400, tanker.waterLiters - 800);
-    const request = s.requests.find((item) => item.tankerId === tanker.id && item.status === "en_route");
+    tanker.waterLiters = Math.max(0, tanker.waterLiters - ASSUMPTIONS.litresPerStop);
+    const request = s.requests.find(
+      (item) => item.tankerId === tanker.id && item.status === "en_route",
+    );
     if (request) request.status = "done";
-    const district = s.districts.find((item) => item.id === tanker.targetDistrictId);
     notify(
       `Водовоз №${tanker.number} на месте`,
-      `${district?.name ?? "Район"}, можно набирать воду. Запас ${tanker.waterLiters.toLocaleString("ru-RU")} л.`,
+      `${nameFor(tanker.targetDistrictId ?? "")}, можно набирать воду. Остаток ${tanker.waterLiters.toLocaleString("ru-RU")} л.`,
       "tanker",
     );
   }
 }
 
-function assignTanker(tanker: Tanker, district: District, eta: number) {
-  const home = homePoint(district);
+function assignTanker(tanker: Tanker, geo: DistrictGeo, eta: number) {
+  const point = deliveryPoint(geo);
   tanker.status = "en_route";
   tanker.startX = tanker.x;
   tanker.startY = tanker.y;
-  tanker.targetX = home.x;
-  tanker.targetY = home.y;
-  tanker.targetDistrictId = district.id;
+  tanker.targetX = point.x;
+  tanker.targetY = point.y;
+  tanker.targetDistrictId = geo.id;
   tanker.tripStartedAt = Date.now();
   tanker.initialEtaMin = eta;
   tanker.tripDurationMs = (eta * 60 * 1000) / SIM_RATIO;
 }
 
-export function dispatchNearest(districtId: string, building = "12", residentName = "Айбек Н.") {
-  const s = store();
-  const district = districtById(districtId);
-  const home = homePoint(district);
-  const idle = s.tankers
-    .filter((tanker) => tanker.status === "idle")
-    .sort(
-      (a, b) =>
-        distance(a.x, a.y, home.x, home.y) - distance(b.x, b.y, home.x, home.y),
-    );
-  const tanker = idle[0];
-  if (!tanker) return null;
-  const eta = etaMinutesFor(distance(tanker.x, tanker.y, home.x, home.y));
-  assignTanker(tanker, district, eta);
+/** Idle tankers ordered by real distance to a district, fullest first on ties. */
+function rankIdle(s: Store, geo: DistrictGeo) {
+  const point = deliveryPoint(geo);
+  return s.tankers
+    .filter((tanker) => tanker.status === "idle" && tanker.waterLiters > 0)
+    .map((tanker) => ({
+      tanker,
+      units: distance(tanker.x, tanker.y, point.x, point.y),
+    }))
+    .sort((a, b) => a.units - b.units || b.tanker.waterLiters - a.tanker.waterLiters);
+}
 
-  let request = s.requests.find(
+export function dispatchNearest(
+  districtId: string,
+  building?: string,
+  residentName = "Диспетчер",
+) {
+  const s = store();
+  const geo = geoFor(districtId);
+  if (!geo) return null;
+  const best = rankIdle(s, geo)[0];
+  if (!best) return null;
+
+  const eta = etaMinutesForUnits(best.units);
+  assignTanker(best.tanker, geo, eta);
+
+  const targetBuilding = building?.trim() || "";
+  const waiting = s.requests.filter(
     (item) =>
       item.districtId === districtId &&
-      item.building === building &&
-      item.residentName === residentName &&
-      item.status === "accepted",
+      item.status === "accepted" &&
+      (!targetBuilding || item.building === targetBuilding),
   );
+  // Newest requests are unshifted, so the last match is the one waiting longest.
+  let request = waiting[waiting.length - 1];
   if (request) {
-    request.tankerId = tanker.id;
+    request.tankerId = best.tanker.id;
     request.status = "en_route";
   } else {
     request = {
       id: uid(),
       number: s.nextRequestNumber,
       districtId,
-      building,
-      tankerId: tanker.id,
+      building: targetBuilding || "—",
+      tankerId: best.tanker.id,
       status: "en_route",
       createdAt: Date.now(),
       residentName,
@@ -411,12 +494,49 @@ export function dispatchNearest(districtId: string, building = "12", residentNam
   }
 
   notify(
-    `Водовоз №${tanker.number} в пути`,
-    `Водовоз №${tanker.number} прибудет к вашему дому через ${eta} минут.`,
+    `Водовоз №${best.tanker.number} в пути`,
+    `${geo.name}: водовоз №${best.tanker.number} прибудет примерно через ${eta} мин (${unitsToKm(best.units).toFixed(1)} км).`,
     "tanker",
   );
-  return { tanker, request, eta };
+  return { tanker: best.tanker, request, eta };
 }
+
+/** Resident asks for water. The tanker stays put until a dispatcher sends it. */
+export function requestDelivery(input: {
+  districtId: string;
+  building?: string;
+  residentName?: string;
+}) {
+  const s = store();
+  const geo = geoFor(input.districtId);
+  if (!geo) return null;
+
+  const building = input.building?.trim() || "—";
+  const residentName = input.residentName?.trim() || "Житель";
+  const open = s.requests.find(
+    (item) =>
+      item.districtId === input.districtId &&
+      item.building === building &&
+      item.status !== "done",
+  );
+  if (open) return open;
+
+  const request: DeliveryRequest = {
+    id: uid(),
+    number: s.nextRequestNumber,
+    districtId: input.districtId,
+    building,
+    tankerId: null,
+    status: "accepted",
+    createdAt: Date.now(),
+    residentName,
+  };
+  s.nextRequestNumber += 1;
+  s.requests.unshift(request);
+  return request;
+}
+
+// --- reports ----------------------------------------------------------------
 
 export function addReport(input: {
   districtId: string;
@@ -425,8 +545,11 @@ export function addReport(input: {
   residentName?: string;
 }) {
   const s = store();
-  const building = input.building?.trim() || "12";
-  const residentName = input.residentName?.trim() || "Айбек Н.";
+  const geo = geoFor(input.districtId);
+  if (!geo) throw new Error(`Unknown district ${input.districtId}`);
+
+  const building = input.building?.trim() || "—";
+  const residentName = input.residentName?.trim() || "Житель";
   const report: Report = {
     id: uid(),
     districtId: input.districtId,
@@ -439,33 +562,33 @@ export function addReport(input: {
   s.reports.unshift(report);
   void persistReport(report).catch(() => undefined);
 
-  const district = districtById(input.districtId);
+  const state = stateById(input.districtId);
   const severe = input.type === "no_water" || input.type === "emergency";
-  if (severe) {
-    district.status = "none";
-    district.expectedNormalAt = null;
-    district.updatedAt = Date.now();
-    district.pressureBar = pressureFor("none");
+
+  if (severe && state.status !== "none") {
+    state.status = "none";
+    state.expectedNormalAt = null;
+    state.updatedAt = Date.now();
+    state.pressureBar = Number(pressureFor("none").toFixed(1));
+    state.cause = `Сигналы жителей, ${geo.name}`;
     notify(
-      `Нет воды: ${district.name}`,
-      `Жители сообщают об отключении в ${district.name}, дом ${building}.`,
+      `Нет воды: ${geo.name}`,
+      `Жители сообщают об отключении, дом ${building}. Район отмечен на карте.`,
       "outage",
     );
-    const already = s.tankers.some(
-      (tanker) => tanker.targetDistrictId === district.id && tanker.status === "en_route",
-    );
-    if (!already) dispatchNearest(district.id, building, residentName);
-  } else if (district.status === "normal") {
-    district.status = "low";
-    district.expectedNormalAt = "18:00";
-    district.updatedAt = Date.now();
-    district.pressureBar = pressureFor("low");
+  } else if (!severe && state.status === "normal") {
+    state.status = "low";
+    state.expectedNormalAt = null;
+    state.updatedAt = Date.now();
+    state.pressureBar = Number(pressureFor("low").toFixed(1));
+    state.cause = `Сигналы о слабом напоре, ${geo.name}`;
     notify(
-      `Слабый напор: ${district.name}`,
+      `Слабый напор: ${geo.name}`,
       "Подача сохраняется, давление ниже нормы.",
       "schedule",
     );
   }
+
   return report;
 }
 
@@ -481,41 +604,56 @@ export function markNotificationsRead(ids?: string[]) {
   }
 }
 
-export function runOutageScenario(districtId = "14") {
+/** Demo control: flood one building with complaints to trip the burst rule. */
+export function runOutageScenario(districtId = DEFAULT_HOME_DISTRICT) {
   const s = store();
+  const geo = geoFor(districtId);
+  if (!geo) return;
   const now = Date.now();
+  const random = rng(now & 0xffff);
+  const building = buildingNumber(geo, random);
+
   for (let i = 0; i < BURST_THRESHOLD; i += 1) {
     const report: Report = {
       id: uid(),
       districtId,
-      building: "12",
+      building,
       type: "no_water",
-      residentName: i === 0 ? "Айбек Н." : `Житель ${i + 20}`,
-      createdAt: now - i * 60 * 1000,
+      residentName: personName(random),
+      createdAt: now - i * 55 * 1000,
       confirmed: false,
     };
     s.reports.unshift(report);
     void persistReport(report).catch(() => undefined);
   }
-  const district = districtById(districtId);
-  district.status = "none";
-  district.expectedNormalAt = null;
-  district.updatedAt = now;
-  district.pressureBar = pressureFor("none");
+
+  const state = stateById(districtId);
+  state.status = "none";
+  state.expectedNormalAt = null;
+  state.updatedAt = now;
+  state.pressureBar = Number(pressureFor("none").toFixed(1));
+  state.cause = `Возможный порыв, дом ${building}`;
+  s.incident = {
+    id: `burst-${districtId}`,
+    title: `Возможный порыв: ${geo.name}, дом ${building}`,
+    summary: `${BURST_THRESHOLD} жалоб из одного дома за ${ASSUMPTIONS.burstWindowMin} минут. Это быстрее обычного вечернего разбора воды, поэтому отмечено как авария.`,
+    districtIds: [districtId],
+    startedAt: now,
+    expectedNormalAt: null,
+  };
   notify(
-    `Нет воды: ${district.name}`,
-    "Серия жалоб из одного дома. Район отмечен красным.",
+    `Нет воды: ${geo.name}`,
+    `Серия жалоб из дома ${building}. Район отмечен на карте.`,
     "outage",
   );
-  const already = s.tankers.some(
-    (tanker) => tanker.targetDistrictId === district.id && tanker.status === "en_route",
-  );
-  if (!already) dispatchNearest(district.id, "12", "Айбек Н.");
 }
 
 export function resetDemo() {
   globalStore.__komektesu = createStore();
+  globalStore.__komektesuVersion = STORE_VERSION;
 }
+
+// --- analysis ---------------------------------------------------------------
 
 function detectAnomalies(s: Store, now: number): Anomaly[] {
   const groups = new Map<string, Report[]>();
@@ -526,74 +664,81 @@ function detectAnomalies(s: Store, now: number): Anomaly[] {
     list.push(report);
     groups.set(key, list);
   }
+
   const anomalies: Anomaly[] = [];
   for (const [key, list] of groups) {
     if (list.length < BURST_THRESHOLD) continue;
     const [districtId, building] = key.split("|");
-    const name = s.districts.find((item) => item.id === districtId)?.name ?? districtId;
     anomalies.push({
       id: key,
       districtId,
       building,
       count: list.length,
       kind: "pipe_burst",
-      message: `Возможный порыв трубы: ${list.length} жалоб из дома ${building}, ${name}, за 15 минут.`,
+      message: `Возможный порыв: ${list.length} жалоб из дома ${building}, ${nameFor(districtId)}, за ${ASSUMPTIONS.burstWindowMin} минут.`,
     });
   }
 
-  const lastHour = s.reports.filter((report) => now - report.createdAt <= 60 * 60 * 1000).length;
+  const lastHour = s.reports.filter((report) => now - report.createdAt <= 3600_000).length;
   const prevHour = s.reports.filter((report) => {
     const age = now - report.createdAt;
-    return age > 60 * 60 * 1000 && age <= 2 * 60 * 60 * 1000;
+    return age > 3600_000 && age <= 2 * 3600_000;
   }).length;
-  if (lastHour >= 6 && lastHour >= prevHour * 2 && !anomalies.some((item) => item.kind === "pipe_burst")) {
+  if (lastHour >= 6 && lastHour >= prevHour * 2 && anomalies.length === 0) {
     anomalies.push({
-      id: "peak",
-      districtId: "14",
+      id: "demand-peak",
+      districtId: s.incident?.districtIds[0] ?? SERVED_DISTRICTS[0].id,
       building: "*",
       count: lastHour,
       kind: "demand_peak",
-      message: `Пик обращений: ${lastHour} за час против ${prevHour} часом ранее.`,
+      message: `Пик обращений: ${lastHour} за последний час против ${prevHour} часом ранее.`,
     });
   }
   return anomalies;
 }
 
-function scheduleFor(status: WaterStatus): ScheduleSlot[] {
+function scheduleFor(status: WaterStatus, expectedNormalAt: string | null): ScheduleSlot[] {
   if (status === "none") {
+    const back = expectedNormalAt ?? "18:00";
     return [
       { from: "06:00", to: "09:00", title: "Подача отключена", status: "none" },
-      { from: "09:00", to: "18:00", title: "Подача отключена", status: "none" },
-      { from: "18:00", to: "21:00", title: "Ожидание водовоза", status: "low" },
-      { from: "21:00", to: "06:00", title: "Подача отключена", status: "none" },
+      { from: "09:00", to: back, title: "Ремонтные работы", status: "none" },
+      { from: back, to: "22:00", title: "Восстановление подачи", status: "low" },
+      { from: "22:00", to: "06:00", title: "Подача по графику", status: "low" },
     ];
   }
   if (status === "low") {
     return [
       { from: "06:00", to: "09:00", title: "Подача воды", status: "normal" },
       { from: "09:00", to: "18:00", title: "Ограниченная подача", status: "low" },
-      { from: "18:00", to: "21:00", title: "Подача воды", status: "normal" },
-      { from: "21:00", to: "06:00", title: "Подача отключена", status: "none" },
+      { from: "18:00", to: "22:00", title: "Подача воды", status: "normal" },
+      { from: "22:00", to: "06:00", title: "Ограниченная подача", status: "low" },
     ];
   }
   return [
     { from: "06:00", to: "09:00", title: "Подача воды", status: "normal" },
     { from: "09:00", to: "18:00", title: "Подача воды", status: "normal" },
-    { from: "18:00", to: "21:00", title: "Подача воды", status: "normal" },
-    { from: "21:00", to: "06:00", title: "Подача отключена", status: "none" },
+    { from: "18:00", to: "22:00", title: "Подача воды", status: "normal" },
+    { from: "22:00", to: "06:00", title: "Подача воды", status: "normal" },
   ];
 }
 
-function forecastText(s: Store, anomalies: Anomaly[], now: number) {
+/** Rule-based readout of the current picture. Deliberately not called a forecast. */
+function situationText(s: Store, anomalies: Anomaly[], now: number) {
   const burst = anomalies.find((item) => item.kind === "pipe_burst");
   if (burst) {
-    return "Серия жалоб из одного дома за 15 минут не похожа на обычный разбор воды. Система считает это возможным порывом и предлагает водовоз.";
+    return `${burst.message} Ближайший свободный водовоз можно отправить вручную.`;
   }
-  const lastHour = s.reports.filter((report) => now - report.createdAt <= 60 * 60 * 1000).length;
+  const outages = s.districts.filter((item) => item.status === "none");
+  const lastHour = s.reports.filter((report) => now - report.createdAt <= 3600_000).length;
+  if (outages.length > 0) {
+    const names = outages.map((item) => nameFor(item.id)).join(", ");
+    return `Без воды: ${names}. За последний час ${lastHour} обращений, порог порыва — ${BURST_THRESHOLD} из одного дома за ${ASSUMPTIONS.burstWindowMin} минут.`;
+  }
   if (lastHour >= 4) {
-    return "Обращения растут. Если темп сохранится, пик придётся на ближайший час — имеет смысл держать свободный водовоз у верхних микрорайонов.";
+    return `Обращения растут: ${lastHour} за час. Стоит держать свободный водовоз ближе к удалённым районам.`;
   }
-  return "Потребление близко к графику. Резких аномалий по жалобам и давлению нет.";
+  return "Аварийных отключений нет. Обращения в пределах обычного фона.";
 }
 
 function publicTanker(tanker: Tanker, home: { x: number; y: number } | null, now: number) {
@@ -606,79 +751,128 @@ function publicTanker(tanker: Tanker, home: { x: number; y: number } | null, now
     y = tanker.startY + (tanker.targetY - tanker.startY) * progress;
     etaMinutes = Math.max(0, Math.round(tanker.initialEtaMin * (1 - progress)));
   }
-  const etaToHome =
-    tanker.status === "idle" && home ? etaMinutesFor(distance(x, y, home.x, home.y)) : tanker.status === "en_route" ? etaMinutes : null;
-  return { ...tanker, x, y, etaMinutes, etaToHome };
+  const units = home ? distance(x, y, home.x, home.y) : null;
+  return {
+    ...tanker,
+    x,
+    y,
+    etaMinutes,
+    etaToHome:
+      tanker.status === "idle" && units !== null
+        ? etaMinutesForUnits(units)
+        : tanker.status === "en_route"
+          ? etaMinutes
+          : null,
+    distanceKm: units === null ? null : Number(unitsToKm(units).toFixed(1)),
+  };
 }
 
-export function getSnapshot(homeDistrictId = "14"): Snapshot {
+export function getSnapshot(homeDistrictId = DEFAULT_HOME_DISTRICT): Snapshot {
   const s = store();
   const now = Date.now();
   settleTrips(s, now);
-  const homeDistrict = s.districts.find((item) => item.id === homeDistrictId) ?? s.districts[0];
-  const home = homePoint(homeDistrict);
+
+  const homeGeo = geoFor(homeDistrictId) ?? SERVED_DISTRICTS[0];
+  const home = deliveryPoint(homeGeo);
   const anomalies = detectAnomalies(s, now);
-  const tankers = s.tankers.map((tanker) => publicTanker(tanker, home, now));
-  const schedules: Record<string, ScheduleSlot[]> = {};
-  for (const district of s.districts) schedules[district.id] = scheduleFor(district.status);
 
-  const hourly: { hour: number; count: number }[] = [];
-  for (let i = 11; i >= 0; i -= 1) {
-    const start = now - (i + 1) * 60 * 60 * 1000;
-    const end = now - i * 60 * 60 * 1000;
-    hourly.push({
-      hour: new Date(end).getHours(),
-      count: s.reports.filter((report) => report.createdAt > start && report.createdAt <= end).length,
-    });
-  }
-
-  const complaintCounts: Record<string, number> = {};
   for (const district of s.districts) {
-    complaintCounts[district.id] = s.reports.filter(
-      (report) => report.districtId === district.id && now - report.createdAt <= 6 * 60 * 60 * 1000,
+    district.complaints6h = s.reports.filter(
+      (report) =>
+        report.districtId === district.id && now - report.createdAt <= 6 * 3600_000,
     ).length;
   }
 
-  const suggestions = s.districts
-    .filter((district) => district.status === "none" || anomalies.some((item) => item.districtId === district.id && item.kind === "pipe_burst"))
-    .flatMap((district) => {
-      const covered = s.tankers.some(
-        (tanker) =>
-          tanker.targetDistrictId === district.id &&
-          (tanker.status === "en_route" || tanker.status === "serving"),
-      );
-      if (covered) return [];
-      const point = homePoint(district);
-      const nearest = s.tankers
-        .filter((tanker) => tanker.status === "idle")
-        .sort((a, b) => distance(a.x, a.y, point.x, point.y) - distance(b.x, b.y, point.x, point.y))[0];
-      if (!nearest) return [];
-      const burst = anomalies.find((item) => item.districtId === district.id && item.kind === "pipe_burst");
-      return [
-        {
-          districtId: district.id,
-          districtName: district.name,
-          tankerId: nearest.id,
-          tankerNumber: nearest.number,
-          etaMinutes: etaMinutesFor(distance(nearest.x, nearest.y, point.x, point.y)),
-          reason: burst ? burst.message : `${district.name} без воды, свободный водовоз рядом.`,
-        },
-      ];
+  const schedules: Record<string, ScheduleSlot[]> = {};
+  for (const district of s.districts) {
+    schedules[district.id] = scheduleFor(district.status, district.expectedNormalAt);
+  }
+
+  const hourly: { hour: number; count: number }[] = [];
+  for (let i = 11; i >= 0; i -= 1) {
+    const start = now - (i + 1) * 3600_000;
+    const end = now - i * 3600_000;
+    hourly.push({
+      hour: new Date(end).getHours(),
+      count: s.reports.filter(
+        (report) => report.createdAt > start && report.createdAt <= end,
+      ).length,
     });
+  }
+
+  const suggestions: Suggestion[] = [];
+  const pendingIds = new Set(
+    s.requests.filter((item) => item.status === "accepted").map((item) => item.districtId),
+  );
+  const needsWater = s.districts.filter(
+    (district) =>
+      district.status === "none" ||
+      pendingIds.has(district.id) ||
+      anomalies.some(
+        (item) => item.districtId === district.id && item.kind === "pipe_burst",
+      ),
+  );
+  for (const district of needsWater) {
+    const geo = geoFor(district.id);
+    if (!geo) continue;
+    const covered = s.tankers.some(
+      (tanker) =>
+        tanker.targetDistrictId === district.id &&
+        (tanker.status === "en_route" || tanker.status === "serving"),
+    );
+    if (covered) continue;
+    const best = rankIdle(s, geo)[0];
+    if (!best) continue;
+    const burst = anomalies.find(
+      (item) => item.districtId === district.id && item.kind === "pipe_burst",
+    );
+    const pending = s.requests.find(
+      (item) => item.districtId === district.id && item.status === "accepted",
+    );
+    suggestions.push({
+      districtId: district.id,
+      districtName: geo.name,
+      tankerId: best.tanker.id,
+      tankerNumber: best.tanker.number,
+      tankerPlate: best.tanker.plate,
+      etaMinutes: etaMinutesForUnits(best.units),
+      distanceKm: Number(unitsToKm(best.units).toFixed(1)),
+      reason: pending
+        ? `Заявка №${pending.number} от ${pending.residentName}, дом ${pending.building}.`
+        : (burst?.message ??
+          district.cause ??
+          `${geo.name} без воды, ближайший свободный водовоз в ${unitsToKm(best.units).toFixed(1)} км.`),
+    });
+  }
+  suggestions.sort((a, b) => a.etaMinutes - b.etaMinutes);
 
   return {
     serverTime: now,
-    homeDistrictId,
+    homeDistrictId: homeGeo.id,
+    meta: {
+      simulated: true,
+      city: CITY.name,
+      operator: UTILITY.name,
+      waterSource: `${WATER_SOURCE.name} — ${WATER_SOURCE.method.toLowerCase()}`,
+      coverage: {
+        districts: COVERAGE.districts,
+        areaKm2: Number(COVERAGE.areaKm2.toFixed(1)),
+        buildings: COVERAGE.buildings,
+        residentialBuildings: COVERAGE.residentialBuildings,
+      },
+      sources: SOURCES.map((item) => ({ ...item })),
+      assumptions: [...ASSUMPTION_NOTES],
+    },
+    incident: s.incident,
     districts: s.districts,
-    tankers,
+    tankers: s.tankers.map((tanker) => publicTanker(tanker, home, now)),
     reports: s.reports,
     requests: s.requests,
     notifications: s.notifications,
     anomalies,
     schedules,
     hourly,
-    forecast: forecastText(s, anomalies, now),
-    complaintCounts,
+    situation: situationText(s, anomalies, now),
     suggestions,
   };
 }

@@ -4,17 +4,23 @@ export type ReportType = "no_water" | "no_hot" | "low_pressure" | "emergency";
 
 export type TankerStatus = "idle" | "en_route" | "serving";
 
-export type District = {
+/**
+ * Live state for one district. Geometry, names and areas are not sent over the
+ * wire: both clients bundle `lib/aktau-geo.ts` and join on `id`, which keeps the
+ * payload small and lets the map draw before the network answers.
+ */
+export type DistrictState = {
   id: string;
-  name: string;
   status: WaterStatus;
-  baseFill: string;
-  path: string;
-  label: { x: number; y: number };
-  anchor: { x: number; y: number };
+  /** Simulated, not a network reading. See ASSUMPTIONS in lib/aktau.ts. */
+  pressureBar: number;
+  /** Planned time supply returns to normal, HH:MM, or null when unknown. */
   expectedNormalAt: string | null;
   updatedAt: number;
-  pressureBar: number;
+  /** Complaints filed in the last 6 hours. */
+  complaints6h: number;
+  /** Why this district is not normal, for the dispatcher. */
+  cause: string | null;
 };
 
 export type Report = {
@@ -22,6 +28,7 @@ export type Report = {
   districtId: string;
   building: string;
   type: ReportType;
+  /** First name plus surname initial, as a dispatcher would see it. */
   residentName: string;
   createdAt: number;
   confirmed: boolean;
@@ -31,6 +38,9 @@ export type Tanker = {
   id: string;
   number: number;
   status: TankerStatus;
+  /** Plate-style label so the fleet reads like real vehicles. */
+  plate: string;
+  capacityLiters: number;
   waterLiters: number;
   x: number;
   y: number;
@@ -42,6 +52,15 @@ export type Tanker = {
   tripStartedAt: number | null;
   tripDurationMs: number;
   initialEtaMin: number;
+};
+
+export type PublicTanker = Tanker & {
+  /** Minutes left on the current trip. */
+  etaMinutes: number;
+  /** Minutes to the caller's district, when the tanker is free. */
+  etaToHome: number | null;
+  /** Straight-line distance to the caller's district, km. */
+  distanceKm: number | null;
 };
 
 export type DeliveryRequest = {
@@ -80,15 +99,54 @@ export type ScheduleSlot = {
   status: WaterStatus;
 };
 
-export type PublicTanker = Tanker & {
+export type Suggestion = {
+  districtId: string;
+  districtName: string;
+  tankerId: string;
+  tankerNumber: number;
+  tankerPlate: string;
   etaMinutes: number;
-  etaToHome: number | null;
+  distanceKm: number;
+  reason: string;
+};
+
+/** The current incident driving the scenario, so the UI can name a cause. */
+export type Incident = {
+  id: string;
+  title: string;
+  summary: string;
+  districtIds: string[];
+  startedAt: number;
+  expectedNormalAt: string | null;
+};
+
+/**
+ * Provenance shipped with every snapshot. The console renders this so nobody
+ * mistakes the simulated operational layer for live utility telemetry.
+ */
+export type SnapshotMeta = {
+  /** True while the operational layer is generated rather than measured. */
+  simulated: boolean;
+  city: string;
+  operator: string;
+  waterSource: string;
+  /** Districts and geometry counted from the OSM extract. */
+  coverage: {
+    districts: number;
+    areaKm2: number;
+    buildings: number;
+    residentialBuildings: number;
+  };
+  sources: { label: string; source: string; detail: string }[];
+  assumptions: string[];
 };
 
 export type Snapshot = {
   serverTime: number;
   homeDistrictId: string;
-  districts: District[];
+  meta: SnapshotMeta;
+  incident: Incident | null;
+  districts: DistrictState[];
   tankers: PublicTanker[];
   reports: Report[];
   requests: DeliveryRequest[];
@@ -96,14 +154,7 @@ export type Snapshot = {
   anomalies: Anomaly[];
   schedules: Record<string, ScheduleSlot[]>;
   hourly: { hour: number; count: number }[];
-  forecast: string;
-  complaintCounts: Record<string, number>;
-  suggestions: {
-    districtId: string;
-    districtName: string;
-    tankerId: string;
-    tankerNumber: number;
-    etaMinutes: number;
-    reason: string;
-  }[];
+  /** Rule-based readout of the complaint trend. Not a forecast model. */
+  situation: string;
+  suggestions: Suggestion[];
 };

@@ -1,0 +1,119 @@
+{
+  "version": 0.6,
+  "generator": "Overpass API 0.7.62.11 87bfad18",
+  "osm3s": {
+    "timestamp_osm_base": "2026-09-22T08:45:51Z",
+    "copyright": "The data included in this document is from www.openstreetmap.org. The data is made available under ODbL."
+  },
+  "elements": [
+
+{
+  "type": "way",
+  "id": 224369643,
+  "center": {
+    "lat": 43.5969571,
+    "lon": 51.2897684
+  },
+  "tags": {
+    "barrier": "wall",
+    "landuse": "industrial",
+    "name": "ТЭЦ-3",
+    "plant:source": "gas",
+    "power": "plant"
+  }
+},
+{
+  "type": "way",
+  "id": 224369646,
+  "center": {
+    "lat": 43.6067444,
+    "lon": 51.2807571
+  },
+  "tags": {
+    "addr:city": "Актау",
+    "addr:housenumber": "65",
+    "addr:street": "Промзона 7",
+    "barrier": "wall",
+    "disused:power": "plant",
+    "int_name": "Mañğıstaw atom énergetïkalıq kombïnatı",
+    "landuse": "industrial",
+    "name": "МАЭК",
+    "name:en": "Maek Kazatom-2 Power Plant",
+    "name:kk": "Маңғыстау атом энергетикалық комбинаты",
+    "name:ru": "Мангистауский Атомно-Энергетический Комбинат — Казатомпром",
+    "phone": "+7(7292) 562-121",
+    "plant:method": "fission",
+    "plant:output:electricity": "350 MW",
+    "plant:output:hot_water": "yes",
+    "plant:source": "gas",
+    "short_name": "ЖШС «МАЭК»",
+    "website": "https://maek.kz",
+    "wikidata": "Q16674089",
+    "wikipedia": "kk:Маңғыстау атом энергетикалық комбинаты"
+  }
+},
+{
+  "type": "way",
+  "id": 415472528,
+  "center": {
+    "lat": 43.6511484,
+    "lon": 51.1780168
+  },
+  "tags": {
+    "addr:housenumber": "43",
+    "addr:place": "22 шағын аудан",
+    "addr:quarter": "22 микрорайон",
+    "addr:street": "22 микрорайон",
+    "building": "yes",
+    "name": "Каспий жылу, су арнасы",
+    "office": "government"
+  }
+},
+{
+  "type": "way",
+  "id": 1474358559,
+  "center": {
+    "lat": 43.6793481,
+    "lon": 51.1395381
+  },
+  "tags": {
+    "access": "private",
+    "man_made": "reservoir_covered"
+  }
+},
+{
+  "type": "way",
+  "id": 1474358561,
+  "center": {
+    "lat": 43.6795081,
+    "lon": 51.1393915
+  },
+  "tags": {
+    "landuse": "industrial",
+    "plant:method": "water-storage",
+    "plant:output:electricity": "yes",
+    "plant:source": "hydro",
+    "power": "plant"
+  }
+},
+{
+  "type": "way",
+  "id": 1474362783,
+  "center": {
+    "lat": 43.6729873,
+    "lon": 51.1392197
+  },
+  "tags": {
+    "access": "private",
+    "building": "yes",
+    "building:levels": "1",
+    "landuse": "industrial",
+    "plant:method": "water-storage",
+    "plant:output:electricity": "yes",
+    "plant:source": "hydro",
+    "power": "plant"
+  }
+}
+
+  ]
+}

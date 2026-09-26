@@ -1,13 +1,28 @@
 "use client";
 
+import { useState } from "react";
 import { useSnapshot } from "@/components/useSnapshot";
-import { Badge, Card, Empty, PageHeader, SectionTitle, SimulatedBadge } from "@/components/ui";
+import { Badge, Button, Card, Empty, PageHeader, SectionTitle, SimulatedBadge } from "@/components/ui";
 import { joinDistricts } from "@/lib/districts";
 import { MAP, statusColor, statusLabelShort, statusTone } from "@/lib/labels";
 
 export default function AnalyticsPage() {
-  const { data, error } = useSnapshot();
+  const { data, error, act } = useSnapshot();
+  const [busy, setBusy] = useState<string | null>(null);
+  const [message, setMessage] = useState<string | null>(null);
   if (!data) return <p className="text-[#667085]">{error ?? "Загрузка аналитики…"}</p>;
+
+  async function sendTruck(districtId: string) {
+    setBusy(districtId);
+    setMessage(null);
+    try {
+      await act("/api/dispatch", { districtId });
+    } catch (err) {
+      setMessage(err instanceof Error ? err.message : "Ошибка");
+    } finally {
+      setBusy(null);
+    }
+  }
 
   const max = Math.max(1, ...data.hourly.map((item) => item.count));
   const districts = joinDistricts(data.districts);
@@ -32,18 +47,35 @@ export default function AnalyticsPage() {
         <p className="mt-2 max-w-4xl text-[15px] leading-6 text-[#344054]">{data.situation}</p>
       </Card>
 
+      {message ? <p className="text-[13px] text-[#e5484d]">{message}</p> : null}
+
       {data.anomalies.length > 0 ? (
         <div className="flex flex-col gap-2">
-          {data.anomalies.map((anomaly) => (
-            <Card key={anomaly.id} className="border-[#f6d5d5] bg-[#fdf4f4]">
-              <div className="flex items-start gap-3">
-                <Badge tone="bg-[#fdeaea] text-[#b4272b]">
-                  {anomaly.kind === "pipe_burst" ? "Порыв" : "Пик"}
-                </Badge>
-                <p className="text-[14px] leading-6 text-[#344054]">{anomaly.message}</p>
-              </div>
-            </Card>
-          ))}
+          {data.anomalies.map((anomaly) => {
+            const suggestion = data.suggestions.find((item) => item.districtId === anomaly.districtId);
+            return (
+              <Card key={anomaly.id} className="border-[#f6d5d5] bg-[#fdf4f4]">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div className="flex min-w-0 items-start gap-3">
+                    <Badge tone="bg-[#fdeaea] text-[#b4272b]">
+                      {anomaly.kind === "pipe_burst" ? "Порыв" : "Пик"}
+                    </Badge>
+                    <p className="text-[14px] leading-6 text-[#344054]">{anomaly.message}</p>
+                  </div>
+                  <Button
+                    disabled={busy !== null || !suggestion}
+                    onClick={() => void sendTruck(anomaly.districtId)}
+                  >
+                    {busy === anomaly.districtId
+                      ? "Отправляем…"
+                      : suggestion
+                        ? `Отправить №${suggestion.tankerNumber}`
+                        : "Нет свободной машины"}
+                  </Button>
+                </div>
+              </Card>
+            );
+          })}
         </div>
       ) : null}
 

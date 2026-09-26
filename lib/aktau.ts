@@ -99,7 +99,7 @@ export const ASSUMPTIONS = {
 export const ASSUMPTION_NOTES = [
   `Скорость водовоза ${ASSUMPTIONS.tankerSpeedKmh} км/ч плюс ${ASSUMPTIONS.dispatchOverheadMin} мин на выезд — расчёт ETA по прямой между точками карты.`,
   `Порыв: ${ASSUMPTIONS.burstThreshold} и больше жалоб из одного дома за ${ASSUMPTIONS.burstWindowMin} минут.`,
-  "Давление, статусы районов, флот и жалобы — сгенерированный сценарий, а не телеметрия сети.",
+  "Цвет района, давление и ETA — модель, пока КЖСА не передаёт давление и GPS водовозов. Жалобы считаются по сохранённым сообщениям.",
 ] as const;
 
 /** Convert a distance in map units to real kilometres. */

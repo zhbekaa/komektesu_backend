@@ -58,7 +58,7 @@ export function Shell({ children }: { children: ReactNode }) {
                 Демо-данные
               </p>
               <p className="mt-1 text-[11px] leading-4 text-[#9a6400]/85">
-                Карта настоящая, оперативный слой сгенерирован.
+                Карта настоящая. Давление и ETA — расчёт, не телеметрия КЖСА.
               </p>
             </div>
             <dl className="flex flex-col gap-1.5 text-[11px] leading-4 text-[#98a2b3]">

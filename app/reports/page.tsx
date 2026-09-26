@@ -19,6 +19,8 @@ export default function ReportsPage() {
   const [districtId, setDistrictId] = useState("all");
   const [type, setType] = useState<"all" | ReportType>("all");
   const [onlyOpen, setOnlyOpen] = useState(false);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [message, setMessage] = useState<string | null>(null);
 
   if (!data) return <p className="text-[#667085]">{error ?? "Загрузка жалоб…"}</p>;
 
@@ -27,9 +29,27 @@ export default function ReportsPage() {
     (report) =>
       (districtId === "all" || report.districtId === districtId) &&
       (type === "all" || report.type === type) &&
-      (!onlyOpen || !report.confirmed),
+      (!onlyOpen || (!report.confirmed && !report.dismissed)),
   );
-  const open = data.reports.filter((report) => !report.confirmed).length;
+  const open = data.reports.filter((report) => !report.confirmed && !report.dismissed).length;
+
+  async function decide(id: string, action: "confirm" | "dismiss" | "dispatch", districtIdForTruck?: string) {
+    setBusy(id + action);
+    setMessage(null);
+    try {
+      if (action === "dispatch" && districtIdForTruck) {
+        await act("/api/dispatch", { districtId: districtIdForTruck });
+      } else if (action === "confirm") {
+        await act("/api/reports", { confirmId: id });
+      } else if (action === "dismiss") {
+        await act("/api/reports", { dismissId: id });
+      }
+    } catch (err) {
+      setMessage(err instanceof Error ? err.message : "Ошибка");
+    } finally {
+      setBusy(null);
+    }
+  }
   const lastHour = data.reports.filter(
     (report) => data.serverTime - report.createdAt <= 3600_000,
   ).length;
@@ -39,9 +59,11 @@ export default function ReportsPage() {
       <PageHeader
         eyebrow="Жалобы"
         title="Сигналы жителей"
-        lead="Каждый сигнал приходит из приложения с микрорайоном и номером дома — так устроена адресация в Актау. Подтверждение возвращается жителю в историю."
+        lead="Подтверждение и отказ уходят жителю уведомлением и остаются в его истории. Если району нужна машина, её можно отправить прямо из этой строки."
         actions={<SimulatedBadge />}
       />
+
+      {message ? <p className="text-[13px] text-[#e5484d]">{message}</p> : null}
 
       <div className="grid grid-cols-2 gap-3 xl:grid-cols-4">
         <Stat label="Всего сигналов" value={String(data.reports.length)} accent={MAP.selected} />
@@ -118,16 +140,37 @@ export default function ReportsPage() {
                   <td className="px-3 py-2.5 text-[#667085]">{report.residentName}</td>
                   <td className="px-5 py-2.5 text-right">
                     {report.confirmed ? (
-                      <span className="text-[12px] font-semibold text-[#127a45]">
-                        Подтверждено
-                      </span>
+                      <span className="text-[12px] font-semibold text-[#127a45]">Подтверждено</span>
+                    ) : report.dismissed ? (
+                      <span className="text-[12px] font-semibold text-[#667085]">Не подтверждено</span>
                     ) : (
-                      <button
-                        className="rounded-full bg-[#e7f0ff] px-3 py-1.5 text-[12px] font-semibold text-[#2f6bff] hover:bg-[#dbe8ff]"
-                        onClick={() => void act("/api/reports", { confirmId: report.id })}
-                      >
-                        Подтвердить
-                      </button>
+                      <span className="inline-flex flex-col items-end gap-1.5">
+                        <span className="inline-flex flex-wrap justify-end gap-1.5">
+                          <button
+                            className="rounded-full bg-[#e7f0ff] px-3 py-1.5 text-[12px] font-semibold text-[#2f6bff] hover:bg-[#dbe8ff] disabled:opacity-55"
+                            disabled={busy !== null}
+                            onClick={() => void decide(report.id, "confirm")}
+                          >
+                            {busy === report.id + "confirm" ? "…" : "Подтвердить"}
+                          </button>
+                          <button
+                            className="rounded-full border border-[#e8ebf0] bg-white px-3 py-1.5 text-[12px] font-semibold text-[#344054] hover:bg-[#f9fafb] disabled:opacity-55"
+                            disabled={busy !== null}
+                            onClick={() => void decide(report.id, "dismiss")}
+                          >
+                            {busy === report.id + "dismiss" ? "…" : "Не совпадает"}
+                          </button>
+                        </span>
+                        {data.suggestions.some((item) => item.districtId === report.districtId) ? (
+                          <button
+                            className="rounded-full bg-[#2f6bff] px-3 py-1.5 text-[12px] font-semibold text-white hover:bg-[#2559e0] disabled:opacity-55"
+                            disabled={busy !== null}
+                            onClick={() => void decide(report.id, "dispatch", report.districtId)}
+                          >
+                            {busy === report.id + "dispatch" ? "Отправляем…" : "Отправить водовоз"}
+                          </button>
+                        ) : null}
+                      </span>
                     )}
                   </td>
                 </tr>

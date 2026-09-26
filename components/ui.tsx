@@ -126,8 +126,8 @@ export function SectionTitle({ children, aside }: { children: ReactNode; aside?:
 }
 
 /**
- * Sticks a visible marker on any screen fed by the simulated operational layer,
- * so nobody reads generated pressure or fleet positions as live telemetry.
+ * Marks pressure, district colour, and tanker ETAs as a model. Complaint counts
+ * are stored reports. КЖСА does not yet send pressure or truck GPS.
  */
 export function SimulatedBadge({ compact = false }: { compact?: boolean }) {
   return (

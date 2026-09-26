@@ -55,24 +55,7 @@ export default function OverviewPage() {
         eyebrow={`${data.meta.operator} · диспетчерская`}
         title="Вода в Актау"
         lead={`${data.meta.coverage.districts} микрорайонов на карте. Источник — ${data.meta.waterSource}.`}
-        actions={
-          <>
-            <SimulatedBadge />
-            <Button
-              disabled={busy !== null}
-              onClick={() => run("outage", "/api/demo", { action: "outage", districtId: "17" })}
-            >
-              {busy === "outage" ? "Сценарий…" : "Сценарий: порыв в 17 мкр"}
-            </Button>
-            <Button
-              variant="ghost"
-              disabled={busy !== null}
-              onClick={() => run("reset", "/api/demo", { action: "reset" })}
-            >
-              Сбросить
-            </Button>
-          </>
-        }
+        actions={<SimulatedBadge />}
       />
 
       {message ? <p className="text-[13px] text-[#e5484d]">{message}</p> : null}
@@ -268,6 +251,30 @@ export default function OverviewPage() {
       <Card>
         <SectionTitle aside={<SimulatedBadge compact />}>Обстановка</SectionTitle>
         <p className="mt-2 max-w-4xl text-[14px] leading-6 text-[#344054]">{data.situation}</p>
+      </Card>
+
+      <Card>
+        <SectionTitle>Демонстрация</SectionTitle>
+        <p className="mt-2 max-w-3xl text-[13px] leading-5 text-[#667085]">
+          Сбросить записывает учебный инцидент в 14 и 15 мкр. Перезапуск показывает
+          последний сохранённый город. Эти кнопки не назначают водовоз и не подтверждают жалобу.
+        </p>
+        <div className="mt-3 flex flex-wrap gap-2">
+          <Button
+            variant="ghost"
+            disabled={busy !== null}
+            onClick={() => run("outage", "/api/demo", { action: "outage", districtId: "17" })}
+          >
+            {busy === "outage" ? "Сценарий…" : "Сценарий: порыв в 17 мкр"}
+          </Button>
+          <Button
+            variant="ghost"
+            disabled={busy !== null}
+            onClick={() => run("reset", "/api/demo", { action: "reset" })}
+          >
+            Сбросить
+          </Button>
+        </div>
       </Card>
     </div>
   );

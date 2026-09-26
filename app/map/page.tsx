@@ -3,15 +3,17 @@
 import { useState } from "react";
 import { CityMap } from "@/components/CityMap";
 import { useSnapshot } from "@/components/useSnapshot";
-import { Badge, Card, Empty, PageHeader, SectionTitle, SimulatedBadge } from "@/components/ui";
+import { Badge, Button, Card, Empty, PageHeader, SectionTitle, SimulatedBadge } from "@/components/ui";
 import { findDistrict, joinDistricts } from "@/lib/districts";
 import { MAP, ago, reportLabel, statusColor, statusLabel, statusTone } from "@/lib/labels";
 
 export default function HeatmapPage() {
-  const { data, error } = useSnapshot();
+  const { data, error, act } = useSnapshot();
   const [selectedId, setSelectedId] = useState("14");
   const [focusId, setFocusId] = useState<string | null>(null);
   const [query, setQuery] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState<string | null>(null);
 
   if (!data) return <p className="text-[#667085]">{error ?? "Загрузка карты…"}</p>;
 
@@ -37,12 +39,24 @@ export default function HeatmapPage() {
     setFocusId(id);
   }
 
+  async function sendTruck() {
+    setBusy(true);
+    setMessage(null);
+    try {
+      await act("/api/dispatch", { districtId: district.id });
+    } catch (err) {
+      setMessage(err instanceof Error ? err.message : "Ошибка");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <div className="flex flex-col gap-5">
       <PageHeader
         eyebrow="Карта"
         title="Давление и жалобы по районам"
-        lead="Цвет района — состояние подачи. Полоса в списке — жалобы за 6 часов относительно самого проблемного района."
+        lead="Цвет района — состояние подачи. Водовозы на этой же карте, и отсюда можно отправить ближайший в выбранный район."
         actions={<SimulatedBadge />}
       />
 
@@ -51,6 +65,8 @@ export default function HeatmapPage() {
           <div className="h-[660px]">
             <CityMap
               districts={data.districts}
+              tankers={data.tankers}
+              showTankers
               selectedId={district.id}
               onSelect={pick}
               focusId={focusId}
@@ -86,6 +102,22 @@ export default function HeatmapPage() {
             {district.cause ? (
               <p className="mt-2 text-[12px] leading-5 text-[#667085]">{district.cause}</p>
             ) : null}
+            {message ? <p className="mt-2 text-[13px] text-[#e5484d]">{message}</p> : null}
+            {(() => {
+              const suggestion = data.suggestions.find((item) => item.districtId === district.id);
+              return (
+                <div className="mt-3">
+                  <Button disabled={busy || !suggestion} onClick={() => void sendTruck()}>
+                    {busy ? "Отправляем…" : suggestion ? `Отправить №${suggestion.tankerNumber}` : "Отправить ближайший"}
+                  </Button>
+                  <p className="mt-2 text-[12px] leading-5 text-[#667085]">
+                    {suggestion
+                      ? suggestion.reason
+                      : "Отправка появится, когда район без воды, есть заявка жителя или порыв, и свободна машина."}
+                  </p>
+                </div>
+              );
+            })()}
             <p className="mt-3 text-[11px] text-[#98a2b3]">
               Границы и площадь — OpenStreetMap, way {district.osmId}.
             </p>

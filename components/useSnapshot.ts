@@ -10,7 +10,10 @@ export function useSnapshot() {
   const refresh = useCallback(async () => {
     try {
       const response = await fetch("/api/state", { cache: "no-store" });
-      if (!response.ok) throw new Error("Не удалось загрузить данные");
+      if (!response.ok) {
+        const payload = (await response.json().catch(() => null)) as { error?: string } | null;
+        throw new Error(payload?.error ?? "Не удалось загрузить данные");
+      }
       setData((await response.json()) as Snapshot);
       setError(null);
     } catch (err) {

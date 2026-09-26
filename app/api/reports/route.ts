@@ -1,5 +1,5 @@
-import { addReport, confirmReport, getSnapshot } from "@/lib/engine";
-import { json, preflight } from "@/lib/http";
+import { addReport, confirmReport, dismissReport, getSnapshot } from "@/lib/engine";
+import { fail, json, preflight } from "@/lib/http";
 import type { ReportType } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
@@ -11,26 +11,34 @@ export function OPTIONS() {
 }
 
 export async function POST(request: Request) {
-  const body = (await request.json()) as {
-    districtId?: string;
-    building?: string;
-    type?: ReportType;
-    residentName?: string;
-    confirmId?: string;
-  };
-  if (body.confirmId) {
-    const report = confirmReport(body.confirmId);
-    if (!report) return json({ error: "Report not found" }, 404);
-    return json(getSnapshot());
+  try {
+    const body = (await request.json()) as {
+      districtId?: string;
+      building?: string;
+      type?: ReportType;
+      residentName?: string;
+      confirmId?: string;
+      dismissId?: string;
+    };
+    if (body.confirmId) {
+      await confirmReport(body.confirmId);
+      return json(await getSnapshot());
+    }
+    if (body.dismissId) {
+      await dismissReport(body.dismissId);
+      return json(await getSnapshot());
+    }
+    if (!body.districtId || !body.type || !TYPES.includes(body.type)) {
+      return json({ error: "districtId and type are required" }, 400);
+    }
+    await addReport({
+      districtId: body.districtId,
+      building: body.building,
+      type: body.type,
+      residentName: body.residentName,
+    });
+    return json(await getSnapshot(body.districtId));
+  } catch (error) {
+    return fail(error);
   }
-  if (!body.districtId || !body.type || !TYPES.includes(body.type)) {
-    return json({ error: "districtId and type are required" }, 400);
-  }
-  addReport({
-    districtId: body.districtId,
-    building: body.building,
-    type: body.type,
-    residentName: body.residentName,
-  });
-  return json(getSnapshot(body.districtId));
 }

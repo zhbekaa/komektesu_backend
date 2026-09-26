@@ -28,10 +28,12 @@ export type Report = {
   districtId: string;
   building: string;
   type: ReportType;
-  /** First name plus surname initial, as a dispatcher would see it. */
+  /** Typed on the phone for this demo. History and notices match the string; there is no residents row yet. */
   residentName: string;
   createdAt: number;
   confirmed: boolean;
+  /** Dispatcher judged this signal as not matching the outage. */
+  dismissed: boolean;
 };
 
 export type Tanker = {
@@ -80,7 +82,9 @@ export type AppNotification = {
   body: string;
   createdAt: number;
   read: boolean;
-  kind: "outage" | "tanker" | "schedule";
+  kind: "outage" | "tanker" | "schedule" | "report";
+  /** Null reaches every resident. A name reaches only that person. */
+  audience: string | null;
 };
 
 export type Anomaly = {

@@ -1,10 +1,11 @@
 /**
- * In-memory simulation of Aktau's water supply for the MVP.
+ * Aktau water supply for the dispatch console and the resident app.
  *
- * The map, district names, adjacency and distances are real (OpenStreetMap, see
- * lib/aktau-geo.ts). The operational layer — pressure, outages, fleet, resident
- * complaints — is generated here from a seeded scenario so a demo is repeatable.
- * Snapshots carry `meta.simulated` so the UI can label it honestly.
+ * OpenStreetMap geometry stays in lib/aktau-geo.ts and is joined by district id.
+ * Pressure and ETAs stay calculated from lib/aktau.ts and are labelled simulated.
+ * Reports, confirmations, tanker trips, notices, and the outage banner are rows
+ * in Supabase. A snapshot is a fresh read. Startup seeds a calm city once.
+ * The 14/15 outage is written only when someone presses Сбросить.
  */
 
 import { DEPOT, DISTRICT_GEO, type DistrictGeo } from "./aktau-geo";
@@ -19,7 +20,27 @@ import {
   etaMinutesForUnits,
   unitsToKm,
 } from "./aktau";
-import { persistReport } from "./supabase";
+import { ActionError } from "./errors";
+import { reportLabel } from "./labels";
+import {
+  arriveTanker,
+  dispatchTanker,
+  ensureSeeded,
+  finishRequest,
+  insertFeedback,
+  insertNotification,
+  insertReports,
+  insertRequest,
+  loadCity,
+  markNotificationsRead as markReadRows,
+  nextRequestNumber,
+  saveDistrict,
+  sendRequest,
+  setIncident,
+  setReportFlag,
+  writeCity,
+  type CityRows,
+} from "./supabase";
 import type {
   Anomaly,
   AppNotification,
@@ -54,11 +75,20 @@ export function geoFor(id: string): DistrictGeo | undefined {
 
 export const DEFAULT_HOME_DISTRICT = "14";
 
+const FLEET = [
+  { number: 12, plate: "823 KZ 12", capacity: 6000 },
+  { number: 7, plate: "417 AK 12", capacity: 4000 },
+  { number: 4, plate: "205 BN 12", capacity: 4000 },
+  { number: 9, plate: "744 CH 12", capacity: 10000 },
+  { number: 3, plate: "118 DM 12", capacity: 6000 },
+  { number: 21, plate: "560 EL 12", capacity: 4000 },
+] as const;
+
 // --- scenario ---------------------------------------------------------------
 
 /**
- * The incident the demo opens on: a repair on the main feeding 14 and 15 мкр,
- * two genuinely adjacent central microdistricts.
+ * The incident Сбросить writes: a repair on the main feeding 14 and 15 мкр.
+ * Startup does not load this.
  */
 const SCENARIO = {
   id: "feeder-14-15",
@@ -72,7 +102,7 @@ const SCENARIO = {
 
 /**
  * Newer districts on the northern edge sit furthest from the depot and the
- * reservoir, so they carry chronically weaker pressure in this scenario.
+ * reservoir, so they carry chronically weaker pressure in the demo scenario.
  */
 const FAR_EDGE_KM = 4.3;
 
@@ -151,28 +181,8 @@ function buildingNumber(district: DistrictGeo, random: () => number) {
   return String(1 + Math.floor(random() * ceiling));
 }
 
-// --- store ------------------------------------------------------------------
-
-type Store = {
-  districts: DistrictState[];
-  tankers: Tanker[];
-  reports: Report[];
-  requests: DeliveryRequest[];
-  notifications: AppNotification[];
-  incident: Incident | null;
-  nextRequestNumber: number;
-};
-
-/** Bump when `Store` changes shape, so a hot reload discards the old snapshot. */
-const STORE_VERSION = 4;
-
-const globalStore = globalThis as typeof globalThis & {
-  __komektesu?: Store;
-  __komektesuVersion?: number;
-};
-
 function uid() {
-  return Math.random().toString(36).slice(2, 10);
+  return crypto.randomUUID();
 }
 
 function pressureFor(status: WaterStatus, random?: () => number) {
@@ -191,28 +201,18 @@ function deliveryPoint(district: DistrictGeo) {
   return { x: district.center.x, y: district.center.y };
 }
 
-/** Fleet parked at the real КЖСА yard, spread so pins do not overlap. */
-function createFleet(random: () => number): Tanker[] {
-  const specs = [
-    { number: 12, plate: "823 KZ 12", capacity: 6000 },
-    { number: 7, plate: "417 AK 12", capacity: 4000 },
-    { number: 4, plate: "205 BN 12", capacity: 4000 },
-    { number: 9, plate: "744 CH 12", capacity: 10000 },
-    { number: 3, plate: "118 DM 12", capacity: 6000 },
-    { number: 21, plate: "560 EL 12", capacity: 4000 },
-  ];
-  return specs.map((spec, index) => {
-    const angle = (index / specs.length) * Math.PI * 2;
+function fleetAt(fill: (capacity: number) => number): Tanker[] {
+  return FLEET.map((spec, index) => {
+    const angle = (index / FLEET.length) * Math.PI * 2;
     const x = DEPOT.x + Math.cos(angle) * 22;
     const y = DEPOT.y + Math.sin(angle) * 22;
-    const fill = 0.55 + random() * 0.45;
     return {
       id: String(spec.number),
       number: spec.number,
       plate: spec.plate,
       status: "idle" as const,
       capacityLiters: spec.capacity,
-      waterLiters: Math.round((spec.capacity * fill) / 100) * 100,
+      waterLiters: fill(spec.capacity),
       x,
       y,
       startX: x,
@@ -227,12 +227,34 @@ function createFleet(random: () => number): Tanker[] {
   });
 }
 
-function createStore(now = Date.now()): Store {
+/** Real tanker list, parked at the КЖСА yard. Written once, when the tables are empty. */
+function parkedFleet(): Tanker[] {
+  return fleetAt((capacity) => Math.round((capacity * 0.8) / 100) * 100);
+}
+
+function baselineDistricts(now: number): DistrictState[] {
+  return SERVED_DISTRICTS.map((geo) => ({
+    id: geo.id,
+    status: "normal" as const,
+    pressureBar: ASSUMPTIONS.nominalPressureBar,
+    expectedNormalAt: null,
+    updatedAt: now,
+    complaints6h: 0,
+    cause: null,
+  }));
+}
+
+function scenarioFleet(random: () => number): Tanker[] {
+  return fleetAt((capacity) => Math.round((capacity * (0.55 + random() * 0.45)) / 100) * 100);
+}
+
+/** The 14/15 demo, including the invented residents. Not used at startup. */
+function buildScenario(now: number): CityRows {
   const random = rng(20240924);
   const statuses = scenarioStatuses();
 
   const districts: DistrictState[] = SERVED_DISTRICTS.map((geo) => {
-    const { status, cause } = statuses.get(geo.id) ?? { status: "normal", cause: null };
+    const { status, cause } = statuses.get(geo.id) ?? { status: "normal" as const, cause: null };
     return {
       id: geo.id,
       status,
@@ -254,7 +276,6 @@ function createStore(now = Date.now()): Store {
     expectedNormalAt: SCENARIO.expectedNormalAt,
   };
 
-  // Complaints cluster where supply is broken and trickle in elsewhere.
   const reports: Report[] = [];
   function addSeedReport(geo: DistrictGeo, type: ReportType, minutesAgo: number) {
     reports.push({
@@ -265,6 +286,7 @@ function createStore(now = Date.now()): Store {
       residentName: personName(random),
       createdAt: now - Math.round(minutesAgo * 60 * 1000),
       confirmed: minutesAgo > 45,
+      dismissed: false,
     });
   }
 
@@ -285,8 +307,7 @@ function createStore(now = Date.now()): Store {
       addSeedReport(geo, random() < 0.5 ? "no_hot" : "low_pressure", 60 + random() * 400);
     }
   }
-  // The resident demo opens as Айбек Н. at 14 мкр, дом 12. One real signal so
-  // history is not blank; a different address still has none.
+  // The resident demo opens as Айбек Н. at 14 мкр, дом 12.
   const demoHome = geoFor("14");
   if (demoHome) {
     reports.push({
@@ -297,16 +318,15 @@ function createStore(now = Date.now()): Store {
       residentName: "Айбек Н.",
       createdAt: now - 3 * 60 * 60 * 1000,
       confirmed: false,
+      dismissed: false,
     });
   }
   reports.sort((a, b) => b.createdAt - a.createdAt);
 
-  const tankers = createFleet(random);
+  const tankers = scenarioFleet(random);
 
-  // One tanker is already handing out water in the worst-hit district.
   const firstOutage = geoFor(SCENARIO.outage[0]);
   const requests: DeliveryRequest[] = [];
-  let nextRequestNumber = 461;
   if (firstOutage) {
     const point = deliveryPoint(firstOutage);
     const serving = tankers[0];
@@ -331,9 +351,7 @@ function createStore(now = Date.now()): Store {
     });
   }
 
-  const outageNames = SCENARIO.outage
-    .map((id) => geoFor(id)?.name ?? id)
-    .join(" и ");
+  const outageNames = SCENARIO.outage.map((id) => geoFor(id)?.name ?? id).join(" и ");
   const notifications: AppNotification[] = [
     {
       id: "n1",
@@ -342,6 +360,7 @@ function createStore(now = Date.now()): Store {
       createdAt: incident.startedAt,
       read: false,
       kind: "outage",
+      audience: null,
     },
     {
       id: "n2",
@@ -352,6 +371,7 @@ function createStore(now = Date.now()): Store {
       createdAt: now - 18 * 60 * 1000,
       read: false,
       kind: "tanker",
+      audience: null,
     },
     {
       id: "n3",
@@ -360,90 +380,91 @@ function createStore(now = Date.now()): Store {
       createdAt: now - 52 * 60 * 1000,
       read: true,
       kind: "schedule",
+      audience: null,
     },
   ];
 
-  return {
-    districts,
-    tankers,
-    reports,
-    requests,
-    notifications,
-    incident,
-    nextRequestNumber,
-  };
+  return { districts, tankers, reports, requests, notifications, incident };
 }
 
-function store() {
-  if (!globalStore.__komektesu || globalStore.__komektesuVersion !== STORE_VERSION) {
-    globalStore.__komektesu = createStore();
-    globalStore.__komektesuVersion = STORE_VERSION;
-  }
-  return globalStore.__komektesu;
+function servedGeo(id: string) {
+  const geo = geoFor(id);
+  if (!geo || geo.kind === "industrial") throw new ActionError("Unknown district", 404);
+  return geo;
 }
 
-function stateById(id: string) {
-  const district = store().districts.find((item) => item.id === id);
-  if (!district) throw new Error(`Unknown district ${id}`);
-  return district;
+async function readCity() {
+  await ensureSeeded(baselineDistricts(Date.now()), parkedFleet());
+  const city = await loadCity();
+  const districtOrder = new Map(SERVED_DISTRICTS.map((district, index) => [district.id, index]));
+  const tankerOrder = new Map(FLEET.map((spec, index) => [String(spec.number), index]));
+  city.districts.sort(
+    (a, b) => (districtOrder.get(a.id) ?? 999) - (districtOrder.get(b.id) ?? 999),
+  );
+  city.tankers.sort((a, b) => (tankerOrder.get(a.id) ?? 999) - (tankerOrder.get(b.id) ?? 999));
+  return city;
 }
 
 function nameFor(id: string) {
   return geoFor(id)?.name ?? id;
 }
 
-function notify(title: string, body: string, kind: AppNotification["kind"]) {
-  store().notifications.unshift({
+function placeLine(report: Report) {
+  return `${reportLabel(report.type)}: ${nameFor(report.districtId)}, дом ${report.building}.`;
+}
+
+function notice(
+  title: string,
+  body: string,
+  kind: AppNotification["kind"],
+  audience: string | null = null,
+): AppNotification {
+  return {
     id: uid(),
     title,
     body,
     createdAt: Date.now(),
     read: false,
     kind,
-  });
+    audience,
+  };
 }
 
 // --- trips ------------------------------------------------------------------
 
-function settleTrips(s: Store, now: number) {
-  for (const tanker of s.tankers) {
-    if (tanker.status !== "en_route" || !tanker.tripStartedAt || !tanker.tripDurationMs) {
-      continue;
-    }
+/** When a stored trip has elapsed, write serving once and close the request. */
+async function settleArrivals(city: CityRows, now: number) {
+  let changed = false;
+  for (const tanker of city.tankers) {
+    if (tanker.status !== "en_route" || !tanker.tripStartedAt || !tanker.tripDurationMs) continue;
     if ((now - tanker.tripStartedAt) / tanker.tripDurationMs < 1) continue;
-    tanker.status = "serving";
-    tanker.x = tanker.targetX;
-    tanker.y = tanker.targetY;
-    tanker.waterLiters = Math.max(0, tanker.waterLiters - ASSUMPTIONS.litresPerStop);
-    const request = s.requests.find(
+    const waterLiters = Math.max(0, tanker.waterLiters - ASSUMPTIONS.litresPerStop);
+    const arrived = await arriveTanker(tanker.id, {
+      x: tanker.targetX,
+      y: tanker.targetY,
+      waterLiters,
+    });
+    if (!arrived) continue;
+    changed = true;
+    const request = city.requests.find(
       (item) => item.tankerId === tanker.id && item.status === "en_route",
     );
-    if (request) request.status = "done";
-    notify(
-      `Водовоз №${tanker.number} на месте`,
-      `${nameFor(tanker.targetDistrictId ?? "")}, можно набирать воду. Остаток ${tanker.waterLiters.toLocaleString("ru-RU")} л.`,
-      "tanker",
+    if (request) await finishRequest(request.id);
+    await insertNotification(
+      notice(
+        `Водовоз №${tanker.number} на месте`,
+        `${nameFor(tanker.targetDistrictId ?? "")}, можно набирать воду. Остаток ${waterLiters.toLocaleString("ru-RU")} л.`,
+        "tanker",
+      ),
     );
   }
-}
-
-function assignTanker(tanker: Tanker, geo: DistrictGeo, eta: number) {
-  const point = deliveryPoint(geo);
-  tanker.status = "en_route";
-  tanker.startX = tanker.x;
-  tanker.startY = tanker.y;
-  tanker.targetX = point.x;
-  tanker.targetY = point.y;
-  tanker.targetDistrictId = geo.id;
-  tanker.tripStartedAt = Date.now();
-  tanker.initialEtaMin = eta;
-  tanker.tripDurationMs = (eta * 60 * 1000) / SIM_RATIO;
+  return changed;
 }
 
 /** Idle tankers ordered by real distance to a district, fullest first on ties. */
-function rankIdle(s: Store, geo: DistrictGeo) {
+function rankIdle(city: CityRows, geo: DistrictGeo) {
   const point = deliveryPoint(geo);
-  return s.tankers
+  return city.tankers
     .filter((tanker) => tanker.status === "idle" && tanker.waterLiters > 0)
     .map((tanker) => ({
       tanker,
@@ -452,68 +473,80 @@ function rankIdle(s: Store, geo: DistrictGeo) {
     .sort((a, b) => a.units - b.units || b.tanker.waterLiters - a.tanker.waterLiters);
 }
 
-export function dispatchNearest(
+export async function dispatchNearest(
   districtId: string,
   building?: string,
   residentName = "Диспетчер",
 ) {
-  const s = store();
-  const geo = geoFor(districtId);
-  if (!geo) return null;
-  const best = rankIdle(s, geo)[0];
-  if (!best) return null;
-
-  const eta = etaMinutesForUnits(best.units);
-  assignTanker(best.tanker, geo, eta);
-
+  const geo = servedGeo(districtId);
+  const city = await readCity();
   const targetBuilding = building?.trim() || "";
-  const waiting = s.requests.filter(
-    (item) =>
-      item.districtId === districtId &&
-      item.status === "accepted" &&
-      (!targetBuilding || item.building === targetBuilding),
-  );
-  // Newest requests are unshifted, so the last match is the one waiting longest.
-  let request = waiting[waiting.length - 1];
-  if (request) {
-    request.tankerId = best.tanker.id;
-    request.status = "en_route";
-  } else {
-    request = {
-      id: uid(),
-      number: s.nextRequestNumber,
-      districtId,
-      building: targetBuilding || "—",
-      tankerId: best.tanker.id,
-      status: "en_route",
-      createdAt: Date.now(),
-      residentName,
-    };
-    s.nextRequestNumber += 1;
-    s.requests.unshift(request);
-  }
+  const point = deliveryPoint(geo);
 
-  notify(
-    `Водовоз №${best.tanker.number} в пути`,
-    `${geo.name}: водовоз №${best.tanker.number} прибудет примерно через ${eta} мин (${unitsToKm(best.units).toFixed(1)} км).`,
-    "tanker",
-  );
-  return { tanker: best.tanker, request, eta };
+  for (const best of rankIdle(city, geo)) {
+    const eta = etaMinutesForUnits(best.units);
+    const now = Date.now();
+    const claimed = await dispatchTanker(best.tanker.id, {
+      startX: best.tanker.x,
+      startY: best.tanker.y,
+      targetX: point.x,
+      targetY: point.y,
+      targetDistrictId: geo.id,
+      tripStartedAt: now,
+      tripDurationMs: Math.round((eta * 60 * 1000) / SIM_RATIO),
+    });
+    if (!claimed) continue;
+
+    const waiting = city.requests
+      .filter(
+        (item) =>
+          item.districtId === districtId &&
+          item.status === "accepted" &&
+          (!targetBuilding || item.building === targetBuilding),
+      )
+      .sort((a, b) => a.createdAt - b.createdAt);
+    const existing = waiting[0];
+    let request: DeliveryRequest;
+    if (existing) {
+      await sendRequest(existing.id, best.tanker.id);
+      request = { ...existing, tankerId: best.tanker.id, status: "en_route" };
+    } else {
+      request = {
+        id: uid(),
+        number: await nextRequestNumber(),
+        districtId,
+        building: targetBuilding || "—",
+        tankerId: best.tanker.id,
+        status: "en_route",
+        createdAt: now,
+        residentName,
+      };
+      await insertRequest(request);
+    }
+
+    await insertNotification(
+      notice(
+        `Водовоз №${best.tanker.number} в пути`,
+        `${geo.name}: водовоз №${best.tanker.number} прибудет примерно через ${eta} мин (${unitsToKm(best.units).toFixed(1)} км).`,
+        "tanker",
+      ),
+    );
+    return { tanker: best.tanker, request, eta };
+  }
+  return null;
 }
 
 /** Resident asks for water. The tanker stays put until a dispatcher sends it. */
-export function requestDelivery(input: {
+export async function requestDelivery(input: {
   districtId: string;
   building?: string;
   residentName?: string;
 }) {
-  const s = store();
-  const geo = geoFor(input.districtId);
-  if (!geo) return null;
-
+  const geo = servedGeo(input.districtId);
+  const city = await readCity();
   const building = input.building?.trim() || "—";
   const residentName = input.residentName?.trim() || "Житель";
-  const open = s.requests.find(
+  const open = city.requests.find(
     (item) =>
       item.districtId === input.districtId &&
       item.building === building &&
@@ -523,58 +556,59 @@ export function requestDelivery(input: {
 
   const request: DeliveryRequest = {
     id: uid(),
-    number: s.nextRequestNumber,
-    districtId: input.districtId,
+    number: await nextRequestNumber(),
+    districtId: geo.id,
     building,
     tankerId: null,
     status: "accepted",
     createdAt: Date.now(),
     residentName,
   };
-  s.nextRequestNumber += 1;
-  s.requests.unshift(request);
+  await insertRequest(request);
   return request;
 }
 
 // --- reports ----------------------------------------------------------------
 
-export function addReport(input: {
+export async function addReport(input: {
   districtId: string;
   building?: string;
   type: ReportType;
   residentName?: string;
 }) {
-  const s = store();
-  const geo = geoFor(input.districtId);
-  if (!geo) throw new Error(`Unknown district ${input.districtId}`);
+  const geo = servedGeo(input.districtId);
+  const city = await readCity();
+  const state = city.districts.find((item) => item.id === geo.id);
+  if (!state) throw new ActionError("Unknown district", 404);
 
   const building = input.building?.trim() || "—";
   const residentName = input.residentName?.trim() || "Житель";
   const report: Report = {
     id: uid(),
-    districtId: input.districtId,
+    districtId: geo.id,
     building,
     type: input.type,
     residentName,
     createdAt: Date.now(),
     confirmed: false,
+    dismissed: false,
   };
-  s.reports.unshift(report);
-  void persistReport(report).catch(() => undefined);
+  await insertReports([report]);
 
-  const state = stateById(input.districtId);
   const severe = input.type === "no_water" || input.type === "emergency";
-
   if (severe && state.status !== "none") {
     state.status = "none";
     state.expectedNormalAt = null;
     state.updatedAt = Date.now();
     state.pressureBar = Number(pressureFor("none").toFixed(1));
     state.cause = `Сигналы жителей, ${geo.name}`;
-    notify(
-      `Нет воды: ${geo.name}`,
-      `Жители сообщают об отключении, дом ${building}. Район отмечен на карте.`,
-      "outage",
+    await saveDistrict(state);
+    await insertNotification(
+      notice(
+        `Нет воды: ${geo.name}`,
+        `Жители сообщают об отключении, дом ${building}. Район отмечен на карте.`,
+        "outage",
+      ),
     );
   } else if (!severe && state.status === "normal") {
     state.status = "low";
@@ -582,39 +616,72 @@ export function addReport(input: {
     state.updatedAt = Date.now();
     state.pressureBar = Number(pressureFor("low").toFixed(1));
     state.cause = `Сигналы о слабом напоре, ${geo.name}`;
-    notify(
-      `Слабый напор: ${geo.name}`,
-      "Подача сохраняется, давление ниже нормы.",
-      "schedule",
+    await saveDistrict(state);
+    await insertNotification(
+      notice(`Слабый напор: ${geo.name}`, "Подача сохраняется, давление ниже нормы.", "schedule"),
     );
   }
-
   return report;
 }
 
-export function confirmReport(id: string) {
-  const report = store().reports.find((item) => item.id === id);
-  if (report) report.confirmed = true;
-  return report ?? null;
+export async function confirmReport(id: string) {
+  const report = (await readCity()).reports.find((item) => item.id === id);
+  if (!report) throw new ActionError("Report not found", 404);
+  if (report.dismissed || report.confirmed) return report;
+  await setReportFlag(id, "confirmed");
+  await insertNotification(
+    notice(
+      "Сигнал подтверждён",
+      `${placeLine(report)} Служба приняла сообщение.`,
+      "report",
+      report.residentName,
+    ),
+  );
+  return { ...report, confirmed: true };
 }
 
-export function markNotificationsRead(ids?: string[]) {
-  for (const item of store().notifications) {
-    if (!ids || ids.includes(item.id)) item.read = true;
-  }
+export async function dismissReport(id: string) {
+  const report = (await readCity()).reports.find((item) => item.id === id);
+  if (!report) throw new ActionError("Report not found", 404);
+  if (report.confirmed || report.dismissed) return report;
+  await setReportFlag(id, "dismissed");
+  await insertNotification(
+    notice(
+      "Сигнал не подтверждён",
+      `${placeLine(report)} Диспетчер не нашёл такой проблемы.`,
+      "report",
+      report.residentName,
+    ),
+  );
+  return { ...report, dismissed: true };
+}
+
+export async function addFeedback(text: string, residentName: string) {
+  const trimmed = text.trim();
+  if (!trimmed) throw new ActionError("Напишите сообщение", 400);
+  const entry = {
+    id: uid(),
+    text: trimmed,
+    residentName: residentName.trim() || "Житель",
+    createdAt: Date.now(),
+  };
+  await insertFeedback(entry);
+  return entry;
+}
+
+export async function markNotificationsRead(ids?: string[]) {
+  await markReadRows(ids);
 }
 
 /** Demo control: flood one building with complaints to trip the burst rule. */
-export function runOutageScenario(districtId = DEFAULT_HOME_DISTRICT) {
-  const s = store();
-  const geo = geoFor(districtId);
-  if (!geo) return;
+export async function runOutageScenario(districtId = DEFAULT_HOME_DISTRICT) {
+  const geo = servedGeo(districtId);
   const now = Date.now();
   const random = rng(now & 0xffff);
   const building = buildingNumber(geo, random);
-
+  const reports: Report[] = [];
   for (let i = 0; i < BURST_THRESHOLD; i += 1) {
-    const report: Report = {
+    reports.push({
       id: uid(),
       districtId,
       building,
@@ -622,42 +689,47 @@ export function runOutageScenario(districtId = DEFAULT_HOME_DISTRICT) {
       residentName: personName(random),
       createdAt: now - i * 55 * 1000,
       confirmed: false,
-    };
-    s.reports.unshift(report);
-    void persistReport(report).catch(() => undefined);
+      dismissed: false,
+    });
   }
+  await readCity();
+  await insertReports(reports);
 
-  const state = stateById(districtId);
+  const city = await loadCity();
+  const state = city.districts.find((item) => item.id === districtId);
+  if (!state) throw new ActionError("Unknown district", 404);
   state.status = "none";
   state.expectedNormalAt = null;
   state.updatedAt = now;
   state.pressureBar = Number(pressureFor("none").toFixed(1));
   state.cause = `Возможный порыв, дом ${building}`;
-  s.incident = {
+  await saveDistrict(state);
+  await setIncident({
     id: `burst-${districtId}`,
     title: `Возможный порыв: ${geo.name}, дом ${building}`,
     summary: `${BURST_THRESHOLD} жалоб из одного дома за ${ASSUMPTIONS.burstWindowMin} минут. Это быстрее обычного вечернего разбора воды, поэтому отмечено как авария.`,
     districtIds: [districtId],
     startedAt: now,
     expectedNormalAt: null,
-  };
-  notify(
-    `Нет воды: ${geo.name}`,
-    `Серия жалоб из дома ${building}. Район отмечен на карте.`,
-    "outage",
+  });
+  await insertNotification(
+    notice(
+      `Нет воды: ${geo.name}`,
+      `Серия жалоб из дома ${building}. Район отмечен на карте.`,
+      "outage",
+    ),
   );
 }
 
-export function resetDemo() {
-  globalStore.__komektesu = createStore();
-  globalStore.__komektesuVersion = STORE_VERSION;
+export async function resetDemo() {
+  await writeCity(buildScenario(Date.now()));
 }
 
 // --- analysis ---------------------------------------------------------------
 
-function detectAnomalies(s: Store, now: number): Anomaly[] {
+function detectAnomalies(city: CityRows, now: number): Anomaly[] {
   const groups = new Map<string, Report[]>();
-  for (const report of s.reports) {
+  for (const report of city.reports) {
     if (now - report.createdAt > BURST_WINDOW_MS) continue;
     const key = `${report.districtId}|${report.building}`;
     const list = groups.get(key) ?? [];
@@ -679,15 +751,15 @@ function detectAnomalies(s: Store, now: number): Anomaly[] {
     });
   }
 
-  const lastHour = s.reports.filter((report) => now - report.createdAt <= 3600_000).length;
-  const prevHour = s.reports.filter((report) => {
+  const lastHour = city.reports.filter((report) => now - report.createdAt <= 3600_000).length;
+  const prevHour = city.reports.filter((report) => {
     const age = now - report.createdAt;
     return age > 3600_000 && age <= 2 * 3600_000;
   }).length;
   if (lastHour >= 6 && lastHour >= prevHour * 2 && anomalies.length === 0) {
     anomalies.push({
       id: "demand-peak",
-      districtId: s.incident?.districtIds[0] ?? SERVED_DISTRICTS[0].id,
+      districtId: city.incident?.districtIds[0] ?? SERVED_DISTRICTS[0].id,
       building: "*",
       count: lastHour,
       kind: "demand_peak",
@@ -724,13 +796,13 @@ function scheduleFor(status: WaterStatus, expectedNormalAt: string | null): Sche
 }
 
 /** Rule-based readout of the current picture. Deliberately not called a forecast. */
-function situationText(s: Store, anomalies: Anomaly[], now: number) {
+function situationText(city: CityRows, anomalies: Anomaly[], now: number) {
   const burst = anomalies.find((item) => item.kind === "pipe_burst");
   if (burst) {
     return `${burst.message} Ближайший свободный водовоз можно отправить вручную.`;
   }
-  const outages = s.districts.filter((item) => item.status === "none");
-  const lastHour = s.reports.filter((report) => now - report.createdAt <= 3600_000).length;
+  const outages = city.districts.filter((item) => item.status === "none");
+  const lastHour = city.reports.filter((report) => now - report.createdAt <= 3600_000).length;
   if (outages.length > 0) {
     const names = outages.map((item) => nameFor(item.id)).join(", ");
     return `Без воды: ${names}. За последний час ${lastHour} обращений, порог порыва — ${BURST_THRESHOLD} из одного дома за ${ASSUMPTIONS.burstWindowMin} минут.`;
@@ -739,6 +811,14 @@ function situationText(s: Store, anomalies: Anomaly[], now: number) {
     return `Обращения растут: ${lastHour} за час. Стоит держать свободный водовоз ближе к удалённым районам.`;
   }
   return "Аварийных отключений нет. Обращения в пределах обычного фона.";
+}
+
+function withEta(tanker: Tanker): Tanker {
+  if (!tanker.tripDurationMs) return { ...tanker, initialEtaMin: 0 };
+  return {
+    ...tanker,
+    initialEtaMin: Math.round((tanker.tripDurationMs * SIM_RATIO) / 60_000),
+  };
 }
 
 function publicTanker(tanker: Tanker, home: { x: number; y: number } | null, now: number) {
@@ -767,24 +847,23 @@ function publicTanker(tanker: Tanker, home: { x: number; y: number } | null, now
   };
 }
 
-export function getSnapshot(homeDistrictId = DEFAULT_HOME_DISTRICT): Snapshot {
-  const s = store();
-  const now = Date.now();
-  settleTrips(s, now);
-
+function project(city: CityRows, homeDistrictId: string, now: number): Snapshot {
+  const tankers = city.tankers.map(withEta);
+  const view: CityRows = { ...city, tankers };
   const homeGeo = geoFor(homeDistrictId) ?? SERVED_DISTRICTS[0];
   const home = deliveryPoint(homeGeo);
-  const anomalies = detectAnomalies(s, now);
+  const anomalies = detectAnomalies(view, now);
 
-  for (const district of s.districts) {
-    district.complaints6h = s.reports.filter(
+  const districts = view.districts.map((district) => ({
+    ...district,
+    complaints6h: view.reports.filter(
       (report) =>
         report.districtId === district.id && now - report.createdAt <= 6 * 3600_000,
-    ).length;
-  }
+    ).length,
+  }));
 
   const schedules: Record<string, ScheduleSlot[]> = {};
-  for (const district of s.districts) {
+  for (const district of districts) {
     schedules[district.id] = scheduleFor(district.status, district.expectedNormalAt);
   }
 
@@ -794,7 +873,7 @@ export function getSnapshot(homeDistrictId = DEFAULT_HOME_DISTRICT): Snapshot {
     const end = now - i * 3600_000;
     hourly.push({
       hour: new Date(end).getHours(),
-      count: s.reports.filter(
+      count: view.reports.filter(
         (report) => report.createdAt > start && report.createdAt <= end,
       ).length,
     });
@@ -802,9 +881,9 @@ export function getSnapshot(homeDistrictId = DEFAULT_HOME_DISTRICT): Snapshot {
 
   const suggestions: Suggestion[] = [];
   const pendingIds = new Set(
-    s.requests.filter((item) => item.status === "accepted").map((item) => item.districtId),
+    view.requests.filter((item) => item.status === "accepted").map((item) => item.districtId),
   );
-  const needsWater = s.districts.filter(
+  const needsWater = districts.filter(
     (district) =>
       district.status === "none" ||
       pendingIds.has(district.id) ||
@@ -815,18 +894,18 @@ export function getSnapshot(homeDistrictId = DEFAULT_HOME_DISTRICT): Snapshot {
   for (const district of needsWater) {
     const geo = geoFor(district.id);
     if (!geo) continue;
-    const covered = s.tankers.some(
+    const covered = tankers.some(
       (tanker) =>
         tanker.targetDistrictId === district.id &&
         (tanker.status === "en_route" || tanker.status === "serving"),
     );
     if (covered) continue;
-    const best = rankIdle(s, geo)[0];
+    const best = rankIdle(view, geo)[0];
     if (!best) continue;
     const burst = anomalies.find(
       (item) => item.districtId === district.id && item.kind === "pipe_burst",
     );
-    const pending = s.requests.find(
+    const pending = view.requests.find(
       (item) => item.districtId === district.id && item.status === "accepted",
     );
     suggestions.push({
@@ -863,16 +942,23 @@ export function getSnapshot(homeDistrictId = DEFAULT_HOME_DISTRICT): Snapshot {
       sources: SOURCES.map((item) => ({ ...item })),
       assumptions: [...ASSUMPTION_NOTES],
     },
-    incident: s.incident,
-    districts: s.districts,
-    tankers: s.tankers.map((tanker) => publicTanker(tanker, home, now)),
-    reports: s.reports,
-    requests: s.requests,
-    notifications: s.notifications,
+    incident: view.incident,
+    districts,
+    tankers: tankers.map((tanker) => publicTanker(tanker, home, now)),
+    reports: view.reports,
+    requests: view.requests,
+    notifications: view.notifications,
     anomalies,
     schedules,
     hourly,
-    situation: situationText(s, anomalies, now),
+    situation: situationText({ ...view, districts }, anomalies, now),
     suggestions,
   };
+}
+
+export async function getSnapshot(homeDistrictId = DEFAULT_HOME_DISTRICT): Promise<Snapshot> {
+  const now = Date.now();
+  let city = await readCity();
+  if (await settleArrivals(city, now)) city = await readCity();
+  return project(city, homeDistrictId, now);
 }

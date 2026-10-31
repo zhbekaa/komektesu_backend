@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import type { ReactNode } from "react";
-import { COVERAGE, UTILITY, WATER_SOURCE } from "@/lib/aktau";
+import { COVERAGE, WATER_SOURCE } from "@/lib/aktau";
 
 const LINKS = [
   { href: "/", label: "Обзор" },
@@ -20,16 +20,12 @@ export function Shell({ children }: { children: ReactNode }) {
     <div className="min-h-screen bg-[#f6f7f9] text-[#1b1f27]">
       <div className="mx-auto flex min-h-screen max-w-[1560px]">
         <aside className="sticky top-0 flex h-screen w-[236px] shrink-0 flex-col border-r border-[#e8ebf0] bg-white px-4 py-6">
-          <Link href="/" className="flex items-center gap-2.5 px-2">
-            <span className="flex h-9 w-9 items-center justify-center rounded-xl bg-[#2f6bff] text-[17px] font-bold text-white">
-              К
-            </span>
-            <span>
-              <span className="block text-[16px] font-bold leading-none">Komektesu</span>
-              <span className="mt-1 block text-[11px] text-[#98a2b3]">
-                {UTILITY.short} · Актау
-              </span>
-            </span>
+          <Link href="/" className="block px-2">
+            <img
+              src="/logo.png"
+              alt="KomekteSU — Ақтау: су мен көмек"
+              className="mx-auto h-auto w-[168px]"
+            />
           </Link>
 
           <nav className="mt-7 flex flex-col gap-0.5">
